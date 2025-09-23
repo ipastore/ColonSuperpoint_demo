@@ -732,9 +732,27 @@ if __name__ == '__main__':
 
   # Create output directory if desired.
   if opt.write:
-    print('==> Will write outputs to %s' % opt.write_dir)
-    if not os.path.exists(opt.write_dir):
-      os.makedirs(opt.write_dir)
+    timestamp = time.strftime('%Y%m%d-%H%M%S')
+    base_write_dir = Path(opt.write_dir)
+    base_write_dir.mkdir(parents=True, exist_ok=True)
+    run_write_dir = base_write_dir / timestamp
+    suffix = 1
+    while run_write_dir.exists():
+      run_write_dir = base_write_dir / f'{timestamp}_{suffix:02d}'
+      suffix += 1
+    run_write_dir.mkdir()
+    print('==> Will write outputs to %s' % run_write_dir)
+    opt.write_dir = str(run_write_dir)
+
+    if opt.config:
+      config_path = Path(opt.config)
+      if config_path.exists():
+        config_copy_path = run_write_dir / f'config_{timestamp}.yaml'
+        config_copy_path.write_text(config_path.read_text(encoding='utf-8'),
+                                   encoding='utf-8')
+        print('==> Saved config snapshot to %s' % config_copy_path)
+      else:
+        print('==> Config file not found, skipping copy: {}'.format(config_path))
 
   print('==> Running Demo.')
   if not opt.no_display:
