@@ -50,6 +50,7 @@ import numpy as np
 import os
 import time
 from pathlib import Path
+from typing import Any, Dict
 
 import cv2
 import torch
@@ -700,37 +701,25 @@ if __name__ == '__main__':
       else:
         print('==> Config file not found, skipping copy: {}'.format(config_path))
 
-  print('==> Running Demo.')
-  if not opt.no_display:
-    print("Keyboard: 'q' to quit, 'k' to toggle keypoints visibility.")
-  while True:
+  def build_visualization(frame_state: Dict[str, Any], draw_keypoints: bool) -> np.ndarray:
+    """Create visualization mosaics using cached frame data.
 
-    start = time.time()
+    Args:
+      frame_state: Cached tensors and arrays describing the last processed frame.
+      draw_keypoints: Flag deciding whether to render untracked keypoints.
 
-    # Get a new image.
-    img, status = vs.next_frame()
-    if status is False:
-      break
+    Returns:
+      Visualization image ready for display or export.
+    """
+    img = frame_state['img']
+    pts = frame_state['pts']
+    heatmap = frame_state['heatmap']
+    untracked_pts = frame_state['untracked_pts']
+    tracks_to_draw = frame_state['tracks']
 
-    # Get points and descriptors.
-    start1 = time.time()
-    pts, desc, heatmap = fe.run(img)
-    end1 = time.time()
-
-    # Add points and descriptors to the tracker.
-    tracker.update(pts, desc)
-
-    # Get tracks for points which were match successfully across all frames.
-    tracks = tracker.get_tracks(opt.min_length)
-
-    render_mask = get_untracked_points_mask(pts, tracks, tracker)
-    untracked_pts = pts[:, render_mask]
-
-    # Primary output - Show point tracks overlayed on top of input image.
     out1 = (np.dstack((img, img, img)) * 255.).astype('uint8')
-    tracks[:, 1] /= float(fe.nn_thresh) # Normalize track scores to [0,1].
-    tracker.draw_tracks(out1, tracks)
-    if show_keypoints and untracked_pts.shape[1] > 0:
+    tracker.draw_tracks(out1, tracks_to_draw)
+    if draw_keypoints and untracked_pts.shape[1] > 0:
       for pt in untracked_pts[:2, :].T:
         pt1 = (int(round(pt[0])), int(round(pt[1])))
         cv2.circle(out1, pt1, 1, (0, 255, 0), -1, lineType=16)
@@ -739,7 +728,7 @@ if __name__ == '__main__':
 
     # Extra output -- Show current point detections.
     out2 = (np.dstack((img, img, img)) * 255.).astype('uint8')
-    if (opt.show_extra or show_keypoints) and pts.shape[1] > 0:
+    if (opt.show_extra or draw_keypoints) and pts.shape[1] > 0:
       for pt in pts[:2, :].T:
         pt1 = (int(round(pt[0])), int(round(pt[1])))
         cv2.circle(out2, pt1, 1, (0, 255, 0), -1, lineType=16)
@@ -747,49 +736,109 @@ if __name__ == '__main__':
 
     # Extra output -- Show the point confidence heatmap.
     if heatmap is not None:
+      heatmap_vis = heatmap.copy()
       min_conf = 0.001
-      heatmap[heatmap < min_conf] = min_conf
-      heatmap = -np.log(heatmap)
-      heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + .00001)
-      out3 = myjet[np.round(np.clip(heatmap*10, 0, 9)).astype('int'), :]
+      heatmap_vis[heatmap_vis < min_conf] = min_conf
+      heatmap_vis = -np.log(heatmap_vis)
+      heatmap_vis = (heatmap_vis - heatmap_vis.min()) / (
+          heatmap_vis.max() - heatmap_vis.min() + .00001)
+      out3 = myjet[np.round(np.clip(heatmap_vis*10, 0, 9)).astype('int'), :]
       out3 = (out3*255).astype('uint8')
       if out3.shape[:2] != out2.shape[:2]:
-        out3 = cv2.resize(out3, (out2.shape[1], out2.shape[0]), interpolation=cv2.INTER_NEAREST)
+        out3 = cv2.resize(out3, (out2.shape[1], out2.shape[0]),
+                          interpolation=cv2.INTER_NEAREST)
     else:
       out3 = np.zeros_like(out2)
     cv2.putText(out3, 'Raw Point Confidences', font_pt, font, font_sc, font_clr, lineType=16)
 
     # Resize final output.
     if opt.show_extra:
-      out = np.hstack((out1, out2, out3))
-      out = cv2.resize(out, (3*opt.display_scale*opt.W, opt.display_scale*opt.H))
-    else:
-      out = cv2.resize(out1, (opt.display_scale*opt.W, opt.display_scale*opt.H))
+      combined = np.hstack((out1, out2, out3))
+      return cv2.resize(
+          combined, (3*opt.display_scale*opt.W, opt.display_scale*opt.H))
+    return cv2.resize(
+        out1, (opt.display_scale*opt.W, opt.display_scale*opt.H))
 
-    # Display visualization image to screen.
+  frame_state: Dict[str, Any] = {}
+  step_mode = not opt.write and not opt.no_display
+  advance_requested = True
+
+  print('==> Running Demo.')
+  if not opt.no_display:
+    print("Keyboard: 'q' to quit, 'k' to toggle keypoints visibility, 's' to toggle step mode.")
+    print('Step mode: space advances when active.')
+    if step_mode:
+      print('Step mode is active. Press space to advance frames.')
+  while True:
+    if advance_requested:
+      start = time.time()
+      img, status = vs.next_frame()
+      if status is False:
+        break
+
+      start1 = time.time()
+      pts, desc, heatmap = fe.run(img)
+      end1 = time.time()
+
+      tracker.update(pts, desc)
+      tracks = tracker.get_tracks(opt.min_length)
+      render_mask = get_untracked_points_mask(pts, tracks, tracker)
+      untracked_pts = pts[:, render_mask]
+
+      tracks_to_draw = tracks.copy()
+      if tracks_to_draw.size != 0:
+        tracks_to_draw[:, 1] /= float(fe.nn_thresh)
+
+      frame_state = {
+          'img': img,
+          'pts': pts,
+          'heatmap': heatmap,
+          'untracked_pts': untracked_pts,
+          'tracks': tracks_to_draw,
+      }
+      out = build_visualization(frame_state, show_keypoints)
+
+      if opt.write:
+        out_file = os.path.join(opt.write_dir, 'frame_%05d.png' % vs.i)
+        print('Writing image to %s' % out_file)
+        cv2.imwrite(out_file, out)
+
+      end = time.time()
+      net_t = (1./ float(end1 - start))
+      total_t = (1./ float(end - start))
+      if opt.show_extra:
+        print('Processed image %d (net+post_process: %.2f FPS, total: %.2f FPS).' %
+              (vs.i, net_t, total_t))
+
+      advance_requested = not step_mode
+    else:
+      if not frame_state:
+        advance_requested = True
+        continue
+      out = build_visualization(frame_state, show_keypoints)
+
     if not opt.no_display:
       cv2.imshow(win, out)
-      key = cv2.waitKey(opt.waitkey) & 0xFF
+      wait_time = 0 if step_mode else opt.waitkey
+      key = cv2.waitKey(wait_time) & 0xFF
       if key == ord('q'):
         print('Quitting, \'q\' pressed.')
         break
-      elif key == ord('k'):
+      if key == ord('k'):
         show_keypoints = not show_keypoints
         state_msg = 'Showing' if show_keypoints else 'Hiding'
         print("{} untracked keypoints (toggle 'k').".format(state_msg))
+      elif key == ord('s'):
+        step_mode = not step_mode
+        if step_mode:
+          advance_requested = False
+          print("Step mode enabled. Press space to advance.")
+        else:
+          advance_requested = True
+          print('Step mode disabled. Resuming continuous playback.')
+      elif key == ord(' ') and step_mode:
+        advance_requested = True
 
-    # Optionally write images to disk.
-    if opt.write:
-      out_file = os.path.join(opt.write_dir, 'frame_%05d.png' % vs.i)
-      print('Writing image to %s' % out_file)
-      cv2.imwrite(out_file, out)
-
-    end = time.time()
-    net_t = (1./ float(end1 - start))
-    total_t = (1./ float(end - start))
-    if opt.show_extra:
-      print('Processed image %d (net+post_process: %.2f FPS, total: %.2f FPS).'\
-            % (vs.i, net_t, total_t))
 
   # Close any remaining windows.
   cv2.destroyAllWindows()
