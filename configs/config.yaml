@@ -10,6 +10,7 @@ camid: 0                           # Camera index if using live capture
 # Model & Weights
 ############################################################
 weights_path: superpoint_v1.pth    # SuperPoint weights file
+model: MagicLeap                   # SuperPoint backbone variant
 
 ############################################################
 # Frame Geometry & Visualization Scaling
