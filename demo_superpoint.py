@@ -49,9 +49,11 @@ import glob
 import numpy as np
 import os
 import time
+from pathlib import Path
 
 import cv2
 import torch
+import yaml
 
 # Stub to warn about opencv version.
 if int(cv2.__version__[0]) < 3: # pragma: no cover
@@ -127,9 +129,23 @@ class SuperPointNet(torch.nn.Module):
 class SuperPointFrontend(object):
   """ Wrapper around pytorch net to help with pre and post image processing. """
   def __init__(self, weights_path, nms_dist, conf_thresh, nn_thresh,
-               cuda=False):
+               cuda=False, mps=False):
     self.name = 'SuperPoint'
+    if cuda and mps:
+      raise ValueError('Cannot enable both CUDA and MPS backends.')
     self.cuda = cuda
+    self.mps = mps
+    if self.mps:
+      mps_backend = getattr(torch.backends, 'mps', None)
+      if mps_backend is None or not mps_backend.is_available():
+        raise ValueError('MPS backend requested but not available in this PyTorch build.')
+    if self.cuda:
+      self.device = torch.device('cuda')
+    elif self.mps:
+      self.device = torch.device('mps')
+    else:
+      self.device = torch.device('cpu')
+    print('Running {} on device: {}'.format(self.name, self.device))
     self.nms_dist = nms_dist
     self.conf_thresh = conf_thresh
     self.nn_thresh = nn_thresh # L2 descriptor distance for good match.
@@ -138,14 +154,10 @@ class SuperPointFrontend(object):
 
     # Load the network in inference mode.
     self.net = SuperPointNet()
-    if cuda:
-      # Train on GPU, deploy on GPU.
-      self.net.load_state_dict(torch.load(weights_path))
-      self.net = self.net.cuda()
-    else:
-      # Train on GPU, deploy on CPU.
-      self.net.load_state_dict(torch.load(weights_path,
-                               map_location=lambda storage, loc: storage))
+    state_dict = torch.load(weights_path, map_location='cpu')
+    self.net.load_state_dict(state_dict)
+    if self.device.type != 'cpu':
+      self.net = self.net.to(self.device)
     self.net.eval()
 
   def nms_fast(self, in_corners, H, W, dist_thresh):
@@ -229,8 +241,8 @@ class SuperPointFrontend(object):
     inp = (inp.reshape(1, H, W))
     inp = torch.from_numpy(inp)
     inp = torch.autograd.Variable(inp).view(1, 1, H, W)
-    if self.cuda:
-      inp = inp.cuda()
+    if self.device.type != 'cpu':
+      inp = inp.to(self.device)
     # Forward pass of network.
     outs = self.net.forward(inp)
     semi, coarse_desc = outs[0], outs[1]
@@ -276,8 +288,8 @@ class SuperPointFrontend(object):
       samp_pts = samp_pts.transpose(0, 1).contiguous()
       samp_pts = samp_pts.view(1, 1, -1, 2)
       samp_pts = samp_pts.float()
-      if self.cuda:
-        samp_pts = samp_pts.cuda()
+      if self.device.type != 'cpu':
+        samp_pts = samp_pts.to(self.device)
       desc = torch.nn.functional.grid_sample(coarse_desc, samp_pts)
       desc = desc.data.cpu().numpy().reshape(D, -1)
       desc /= np.linalg.norm(desc, axis=0)[np.newaxis, :]
@@ -484,6 +496,45 @@ class PointTracker(object):
           clr2 = (255, 0, 0)
           cv2.circle(out, p2, stroke, clr2, -1, lineType=16)
 
+
+def get_untracked_points_mask(pts: np.ndarray, tracks: np.ndarray, tracker: 'PointTracker') -> np.ndarray:
+  """Calculate mask for points that are not currently tracked.
+
+  Args:
+    pts: Array of current frame points shaped 3xN.
+    tracks: Matrix with active track metadata.
+    tracker: Tracker managing global point identifiers.
+
+  Returns:
+    Boolean mask where True marks points that are not yet part of a track.
+  """
+  num_pts = pts.shape[1]
+  if num_pts == 0:
+    return np.ones((0,), dtype=bool)
+
+  if tracks.size == 0:
+    return np.ones(num_pts, dtype=bool)
+
+  offsets = tracker.get_offsets()
+  if offsets.size == 0:
+    return np.ones(num_pts, dtype=bool)
+
+  untracked_mask = np.ones(num_pts, dtype=bool)
+  current_offset = offsets[-1]
+  current_tracked_ids = tracks[:, -1].astype(np.int64)
+  current_tracked_ids = current_tracked_ids[current_tracked_ids >= 0]
+  if current_tracked_ids.size == 0:
+    return untracked_mask
+
+  local_indices = current_tracked_ids - current_offset
+  valid_local = local_indices[(local_indices >= 0) & (local_indices < num_pts)]
+  if valid_local.size == 0:
+    return untracked_mask
+
+  untracked_mask[valid_local] = False
+  return untracked_mask
+
+
 class VideoStreamer(object):
   """ Class to help process image streams. Three types of possible inputs:"
     1.) USB Webcam.
@@ -577,8 +628,13 @@ class VideoStreamer(object):
 if __name__ == '__main__':
 
   # Parse command line arguments.
-  parser = argparse.ArgumentParser(description='PyTorch SuperPoint Demo.')
-  parser.add_argument('input', type=str, default='',
+  config_parser = argparse.ArgumentParser(add_help=False)
+  config_parser.add_argument('--config', type=str,
+      help='YAML file with default options (keys must match CLI flags).')
+
+  parser = argparse.ArgumentParser(parents=[config_parser],
+                                   description='PyTorch SuperPoint Demo.')
+  parser.add_argument('input', type=str, nargs='?', default='',
       help='Image directory or movie file or "camera" (for webcam).')
   parser.add_argument('--weights_path', type=str, default='superpoint_v1.pth',
       help='Path to pretrained weights file (default: superpoint_v1.pth).')
@@ -598,6 +654,8 @@ if __name__ == '__main__':
       help='Minimum length of point tracks (default: 2).')
   parser.add_argument('--max_length', type=int, default=5,
       help='Maximum length of point tracks (default: 5).')
+  parser.add_argument('--show_keypoints', action='store_true',
+      help='Show detected keypoints that are not currently tracked (default: False).')
   parser.add_argument('--nms_dist', type=int, default=4,
       help='Non Maximum Suppression (NMS) distance (default: 4).')
   parser.add_argument('--conf_thresh', type=float, default=0.015,
@@ -610,14 +668,38 @@ if __name__ == '__main__':
       help='OpenCV waitkey time in ms (default: 1).')
   parser.add_argument('--cuda', action='store_true',
       help='Use cuda GPU to speed up network processing speed (default: False)')
+  parser.add_argument('--mps', action='store_true',
+      help='Use Apple Metal Performance Shaders backend (default: False).')
   parser.add_argument('--no_display', action='store_true',
       help='Do not display images to screen. Useful if running remotely (default: False).')
   parser.add_argument('--write', action='store_true',
       help='Save output frames to a directory (default: False)')
   parser.add_argument('--write_dir', type=str, default='tracker_outputs/',
       help='Directory where to write output frames (default: tracker_outputs/).')
-  opt = parser.parse_args()
+
+  config_args, remaining = config_parser.parse_known_args()
+  if config_args.config:
+    config_path = Path(config_args.config)
+    if not config_path.exists():
+      parser.error('Config file not found: {}'.format(config_path))
+    config_data = yaml.safe_load(config_path.read_text()) or {}
+    if not isinstance(config_data, dict):
+      parser.error('Config file must map option names to values.')
+    parser.set_defaults(**config_data)
+
+  opt = parser.parse_args(remaining)
+  opt.config = config_args.config
+  if opt.cuda and opt.mps:
+    parser.error('Choose only one accelerator: either --cuda or --mps.')
+  if opt.mps:
+    mps_backend = getattr(torch.backends, 'mps', None)
+    if mps_backend is None or not mps_backend.is_available():
+      parser.error('MPS backend requested but not available in this PyTorch build.')
+  if not opt.input:
+    parser.error('No input specified. Provide a source on the command line or in the YAML config via "input".')
   print(opt)
+
+  show_keypoints = opt.show_keypoints or opt.write
 
   # This class helps load input images from different sources.
   vs = VideoStreamer(opt.input, opt.camid, opt.H, opt.W, opt.skip, opt.img_glob)
@@ -628,7 +710,8 @@ if __name__ == '__main__':
                           nms_dist=opt.nms_dist,
                           conf_thresh=opt.conf_thresh,
                           nn_thresh=opt.nn_thresh,
-                          cuda=opt.cuda)
+                          cuda=opt.cuda,
+                          mps=opt.mps)
   print('==> Successfully loaded pre-trained network.')
 
   # This class helps merge consecutive point matches into tracks.
@@ -654,6 +737,8 @@ if __name__ == '__main__':
       os.makedirs(opt.write_dir)
 
   print('==> Running Demo.')
+  if not opt.no_display:
+    print("Keyboard: 'q' to quit, 'k' to toggle keypoints visibility.")
   while True:
 
     start = time.time()
@@ -674,18 +759,26 @@ if __name__ == '__main__':
     # Get tracks for points which were match successfully across all frames.
     tracks = tracker.get_tracks(opt.min_length)
 
+    render_mask = get_untracked_points_mask(pts, tracks, tracker)
+    untracked_pts = pts[:, render_mask]
+
     # Primary output - Show point tracks overlayed on top of input image.
     out1 = (np.dstack((img, img, img)) * 255.).astype('uint8')
     tracks[:, 1] /= float(fe.nn_thresh) # Normalize track scores to [0,1].
     tracker.draw_tracks(out1, tracks)
+    if show_keypoints and untracked_pts.shape[1] > 0:
+      for pt in untracked_pts[:2, :].T:
+        pt1 = (int(round(pt[0])), int(round(pt[1])))
+        cv2.circle(out1, pt1, 1, (0, 255, 0), -1, lineType=16)
     if opt.show_extra:
       cv2.putText(out1, 'Point Tracks', font_pt, font, font_sc, font_clr, lineType=16)
 
     # Extra output -- Show current point detections.
     out2 = (np.dstack((img, img, img)) * 255.).astype('uint8')
-    for pt in pts.T:
-      pt1 = (int(round(pt[0])), int(round(pt[1])))
-      cv2.circle(out2, pt1, 1, (0, 255, 0), -1, lineType=16)
+    if (opt.show_extra or show_keypoints) and pts.shape[1] > 0:
+      for pt in pts[:2, :].T:
+        pt1 = (int(round(pt[0])), int(round(pt[1])))
+        cv2.circle(out2, pt1, 1, (0, 255, 0), -1, lineType=16)
     cv2.putText(out2, 'Raw Point Detections', font_pt, font, font_sc, font_clr, lineType=16)
 
     # Extra output -- Show the point confidence heatmap.
@@ -696,6 +789,8 @@ if __name__ == '__main__':
       heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + .00001)
       out3 = myjet[np.round(np.clip(heatmap*10, 0, 9)).astype('int'), :]
       out3 = (out3*255).astype('uint8')
+      if out3.shape[:2] != out2.shape[:2]:
+        out3 = cv2.resize(out3, (out2.shape[1], out2.shape[0]), interpolation=cv2.INTER_NEAREST)
     else:
       out3 = np.zeros_like(out2)
     cv2.putText(out3, 'Raw Point Confidences', font_pt, font, font_sc, font_clr, lineType=16)
@@ -714,6 +809,10 @@ if __name__ == '__main__':
       if key == ord('q'):
         print('Quitting, \'q\' pressed.')
         break
+      elif key == ord('k'):
+        show_keypoints = not show_keypoints
+        state_msg = 'Showing' if show_keypoints else 'Hiding'
+        print("{} untracked keypoints (toggle 'k').".format(state_msg))
 
     # Optionally write images to disk.
     if opt.write:

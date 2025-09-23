@@ -1,0 +1,52 @@
+############################################################
+# Source & Input
+############################################################
+input: assets/Seq_035_b.mp4        # Video file, image directory, or "camera"
+img_glob: '*.png'                  # Pattern when reading from an image folder
+skip: 1                            # Frame or image stride when iterating inputs
+camid: 0                           # Camera index if using live capture
+
+############################################################
+# Model & Weights
+############################################################
+weights_path: superpoint_v1.pth    # SuperPoint weights file
+
+############################################################
+# Frame Geometry & Visualization Scaling
+############################################################
+H: 270                             # 1080 / batch_size. If bs 4, H: 270
+W: 360                             # 1440 / batch_size. If bs 4, W: 360
+display_scale: 1                   # Multiplicative scale for display windows
+no_display: false                  # Disable all OpenCV UI windows
+
+############################################################
+# Detector & Matcher Thresholds
+############################################################
+nms_dist: 4                        # Non-maximum suppression radius (pixels)
+conf_thresh: 0.015                 # SuperPoint confidence threshold
+nn_thresh: 0.7                     # Descriptor match threshold for tracking
+
+############################################################
+# Tracking Parameters
+############################################################
+min_length: 2                      # Drop tracks shorter than this many frames
+max_length: 5                      # Sliding window length for the tracker
+
+############################################################
+# Visualization Toggles
+############################################################
+show_extra: false                  # Show additional debug panels (out2/out3)
+show_keypoints: false              # Draw untracked keypoints on main view
+waitkey: 1                         # OpenCV waitKey delay in ms (frame pacing)
+
+############################################################
+# Acceleration Backends
+############################################################
+cuda: false                        # Enable CUDA backend (if available)
+mps: true                         # Enable Apple Metal Performance Shaders
+
+############################################################
+# Output & Logging
+############################################################
+write: false                       # Persist output frames to disk
+write_dir: tracker_outputs/  # Destination directory when write=true
