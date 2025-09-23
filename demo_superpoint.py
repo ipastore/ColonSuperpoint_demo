@@ -722,7 +722,7 @@ if __name__ == '__main__':
     if draw_keypoints and untracked_pts.shape[1] > 0:
       for pt in untracked_pts[:2, :].T:
         pt1 = (int(round(pt[0])), int(round(pt[1])))
-        cv2.circle(out1, pt1, 1, (0, 255, 0), -1, lineType=16)
+        cv2.circle(out1, pt1, 1, (0, 0, 255), -1, lineType=16)
     if opt.show_extra:
       cv2.putText(out1, 'Point Tracks', font_pt, font, font_sc, font_clr, lineType=16)
 
@@ -731,7 +731,7 @@ if __name__ == '__main__':
     if (opt.show_extra or draw_keypoints) and pts.shape[1] > 0:
       for pt in pts[:2, :].T:
         pt1 = (int(round(pt[0])), int(round(pt[1])))
-        cv2.circle(out2, pt1, 1, (0, 255, 0), -1, lineType=16)
+        cv2.circle(out2, pt1, 1, (0, 0, 255), -1, lineType=16)
     cv2.putText(out2, 'Raw Point Detections', font_pt, font, font_sc, font_clr, lineType=16)
 
     # Extra output -- Show the point confidence heatmap.

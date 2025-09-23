@@ -1,5 +1,7 @@
 utils/
-assets/
+assets/*
+!assets/Seq_035_b_subset/
+!assets/Seq_035_b_subset/*.png
 __pycache__/
 .DS_Store
 tracker_outputs/
