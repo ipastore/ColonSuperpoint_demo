@@ -18,22 +18,6 @@ GitHub Copilot: Based on my analysis of both `demo_superpoint` and `demo_supergl
   - `'t/g'` keys: Adjust NN matching threshold (±0.05)
 - **Benefit**: Immediate feedback on parameter sensitivity for colonoscopy images
 
-### **3. Dual Video Comparison Mode** ⭐
-- **Feature**: Side-by-side comparison of two video streams
-- **Use Cases**:
-  - Compare different parameter settings
-  - Before/after preprocessing comparison
-  - Different model configurations
-- **Display**: Synchronized dual window layout like demo_superglue
-
-### **4. Anchor Frame Reference System** ⭐
-- **Feature**: Set specific frames as reference points
-- **Controls**:
-  - `'n'` key to set current frame as anchor
-  - `'a'` key to return to last anchor frame
-  - `'1-9'` keys to set/recall numbered anchors
-- **Benefit**: Compare tracking quality against key anatomical landmarks
-
 ### **5. Advanced Keypoint Filtering** ⭐
 - **Feature**: Interactive keypoint visibility controls
 - **Options**:

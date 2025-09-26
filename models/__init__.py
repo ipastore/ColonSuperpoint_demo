@@ -7,11 +7,13 @@ import torch
 from torch import nn
 
 from .MagicLeap import SuperPointNet as MagicLeapSuperPointNet
+from .SuperpointNet import SuperPointNet as BatchNormSuperPointNet
+from .SuperpointNetGauss2 import SuperPointNetGauss2
 
 SUPERPOINT_MODEL_FACTORIES: Dict[str, Callable[[], nn.Module]] = {
     'MagicLeap': MagicLeapSuperPointNet,
-    'SuperpointNet': MagicLeapSuperPointNet,
-    'SuperpointNet_gauss2': MagicLeapSuperPointNet,
+    'SuperpointNet': BatchNormSuperPointNet,
+    'SuperpointNet_gauss2': SuperPointNetGauss2,
 }
 
 
