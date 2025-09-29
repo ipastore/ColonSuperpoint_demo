@@ -50,7 +50,7 @@ import numpy as np
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple
 
 import cv2
 import torch
@@ -260,6 +260,25 @@ class PointTracker(object):
     self.tracks = np.zeros((0, self.maxl+2))
     self.track_count = 0
     self.max_score = 9999
+
+  def save_state(self) -> Dict[str, Any]:
+    """Create a deep copy snapshot of the tracker buffers."""
+    return {
+        'last_desc': None if self.last_desc is None else self.last_desc.copy(),
+        'all_pts': [pts.copy() for pts in self.all_pts],
+        'tracks': self.tracks.copy(),
+        'track_count': self.track_count,
+        'nn_thresh': self.nn_thresh,
+    }
+
+  def load_state(self, state: Dict[str, Any]) -> None:
+    """Restore the tracker buffers from a snapshot created with save_state."""
+    last_desc = state.get('last_desc')
+    self.last_desc = None if last_desc is None else last_desc.copy()
+    self.all_pts = [pts.copy() for pts in state['all_pts']]
+    self.tracks = state['tracks'].copy()
+    self.track_count = state['track_count']
+    self.nn_thresh = state['nn_thresh']
 
   def nn_match_two_way(self, desc1, desc2, nn_thresh):
     """
@@ -493,6 +512,7 @@ class VideoStreamer(object):
     self.i = 0
     self.skip = skip
     self.maxlen = 1000000
+    self.last_name = ''
     # If the "basedir" string is the word camera, then use a webcam.
     if basedir == "camera/" or basedir == "camera":
       print('==> Processing Webcam Input.')
@@ -555,6 +575,9 @@ class VideoStreamer(object):
         return (None, False)
       if self.video_file:
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.listing[self.i])
+        name = 'frame_%06d' % self.listing[self.i]
+      else:
+        name = 'camera_%06d' % self.i
       input_image = cv2.resize(input_image, (self.sizer[1], self.sizer[0]),
                                interpolation=cv2.INTER_AREA)
       input_image = cv2.cvtColor(input_image, cv2.COLOR_RGB2GRAY)
@@ -562,8 +585,10 @@ class VideoStreamer(object):
     else:
       image_file = self.listing[self.i]
       input_image = self.read_image(image_file, self.sizer)
+      name = os.path.basename(image_file)
     # Increment internal counter.
     self.i = self.i + 1
+    self.last_name = name
     input_image = input_image.astype('float32')
     return (input_image, True)
 
@@ -665,9 +690,12 @@ if __name__ == '__main__':
   tracker = PointTracker(opt.max_length, nn_thresh=fe.nn_thresh)
 
   # Create a window to display the demo.
+  info_win = None
   if not opt.no_display:
     win = 'SuperPoint Tracker'
+    info_win = 'SuperPoint Help'
     cv2.namedWindow(win)
+    cv2.namedWindow(info_win, cv2.WINDOW_AUTOSIZE)
   else:
     print('Skipping visualization, will not show a GUI.')
 
@@ -759,16 +787,90 @@ if __name__ == '__main__':
     return cv2.resize(
         out1, (opt.display_scale*opt.W, opt.display_scale*opt.H))
 
+  def run_superpoint_pass(current_img: np.ndarray,
+                          baseline_state: Dict[str, Any],
+                          frame_label: str) -> Tuple[Dict[str, Any], float]:
+    """Run detector + tracker update starting from a saved tracker state."""
+    tracker.load_state(baseline_state)
+    forward_start = time.time()
+    pts, desc, heatmap = fe.run(current_img)
+    forward_end = time.time()
+
+    tracker.update(pts, desc)
+    tracks = tracker.get_tracks(opt.min_length)
+    render_mask = get_untracked_points_mask(pts, tracks, tracker)
+    untracked_pts = pts[:, render_mask]
+
+    tracks_to_draw = tracks.copy()
+    if tracks_to_draw.size != 0:
+      tracks_to_draw[:, 1] /= float(fe.nn_thresh)
+
+    updated_state: Dict[str, Any] = {
+        'img': current_img,
+        'pts': pts,
+        'heatmap': heatmap,
+        'untracked_pts': untracked_pts,
+        'tracks': tracks_to_draw,
+        'tracker_pre': baseline_state,
+        'frame_name': frame_label,
+    }
+    updated_state['tracker_post'] = tracker.save_state()
+    return updated_state, float(forward_end - forward_start)
+
+  def build_help_panel(frame_label: str,
+                       step_mode_active: bool,
+                       keypoints_visible: bool) -> np.ndarray:
+    """Render the help summary and parameter dashboard."""
+    panel_width = 360
+    top_margin = 26
+    line_h = 22
+    bottom_margin = 20
+
+    controls = [
+        'Controls:',
+        " q: quit    s: step",
+        " ,: previous",
+        " .: next",
+        " k: toggle keypoints",
+        " e/r: conf +/-",
+        " d/f: NMS +/-",
+        " t/g: match +/-",
+    ]
+    status = [
+        '',
+        'Status:',
+        f" step mode: {'ON' if step_mode_active else 'OFF'}",
+        f" keypoints: {'ON' if keypoints_visible else 'OFF'}",
+        f' conf thresh: {fe.conf_thresh:.4f}',
+        f' nms dist: {fe.nms_dist}',
+        f' match thresh: {fe.nn_thresh:.2f}',
+        f' frame: {frame_label}',
+    ]
+
+    lines = controls + status
+    panel_height = max(260, top_margin + bottom_margin + line_h * len(lines))
+    panel = np.zeros((panel_height, panel_width, 3), dtype=np.uint8)
+    panel[:] = 24
+    origin_y = top_margin
+    for idx, text in enumerate(lines):
+      cv2.putText(panel, text, (12, origin_y + idx*line_h),
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, lineType=16)
+    return panel
+
   frame_state: Dict[str, Any] = {}
+  frame_history: List[Dict[str, Any]] = []
+  history_index = -1
   step_mode = not opt.write and not opt.no_display
   advance_requested = True
+  redraw_requested = False
 
   print('==> Running Demo.')
   if not opt.no_display:
-    print("Keyboard: 'q' to quit, 'k' to toggle keypoints visibility, 's' to toggle step mode.")
-    print('Step mode: space advances when active.')
+    print("Keyboard: 'q' to quit, 'k' toggle keypoints, 's' toggle step mode.")
+    print("Keyboard: 'e/r' adjust confidence, 'd/f' adjust NMS, 't/g' adjust match threshold.")
+    print("Step mode: ',' moves back, '.' advances.")
     if step_mode:
-      print('Step mode is active. Press space to advance frames.')
+      print("Step mode is active. Use '.' to advance, ',' to revisit the previous frame.")
   while True:
     if advance_requested:
       start = time.time()
@@ -776,26 +878,13 @@ if __name__ == '__main__':
       if status is False:
         break
 
-      start1 = time.time()
-      pts, desc, heatmap = fe.run(img)
-      end1 = time.time()
-
-      tracker.update(pts, desc)
-      tracks = tracker.get_tracks(opt.min_length)
-      render_mask = get_untracked_points_mask(pts, tracks, tracker)
-      untracked_pts = pts[:, render_mask]
-
-      tracks_to_draw = tracks.copy()
-      if tracks_to_draw.size != 0:
-        tracks_to_draw[:, 1] /= float(fe.nn_thresh)
-
-      frame_state = {
-          'img': img,
-          'pts': pts,
-          'heatmap': heatmap,
-          'untracked_pts': untracked_pts,
-          'tracks': tracks_to_draw,
-      }
+      baseline_state = tracker.save_state()
+      frame_label = vs.last_name or 'frame_%06d' % max(vs.i - 1, 0)
+      frame_state, forward_time = run_superpoint_pass(img, baseline_state, frame_label)
+      if history_index < len(frame_history) - 1:
+        frame_history[:] = frame_history[:history_index + 1]
+      frame_history.append(frame_state)
+      history_index = len(frame_history) - 1
       out = build_visualization(frame_state, show_keypoints)
 
       if opt.write:
@@ -804,21 +893,34 @@ if __name__ == '__main__':
         cv2.imwrite(out_file, out)
 
       end = time.time()
-      net_t = (1./ float(end1 - start))
-      total_t = (1./ float(end - start))
+      safe_forward = max(forward_time, 1e-6)
+      safe_total = max(end - start, 1e-6)
+      net_t = 1. / safe_forward
+      total_t = 1. / safe_total
       if opt.show_extra:
         print('Processed image %d (net+post_process: %.2f FPS, total: %.2f FPS).' %
               (vs.i, net_t, total_t))
 
       advance_requested = not step_mode
+      redraw_requested = False
     else:
       if not frame_state:
         advance_requested = True
         continue
+      if redraw_requested and history_index >= 0:
+        baseline_state = frame_state['tracker_pre']
+        frame_state, _ = run_superpoint_pass(frame_state['img'], baseline_state,
+                                             frame_state['frame_name'])
+        frame_history[history_index] = frame_state
+        redraw_requested = False
+        advance_requested = not step_mode
       out = build_visualization(frame_state, show_keypoints)
 
     if not opt.no_display:
       cv2.imshow(win, out)
+      current_frame_label = frame_state['frame_name'] if frame_state else '-'
+      dashboard = build_help_panel(current_frame_label, step_mode, show_keypoints)
+      cv2.imshow(info_win, dashboard)
       wait_time = 0 if step_mode else opt.waitkey
       key = cv2.waitKey(wait_time) & 0xFF
       if key == ord('q'):
@@ -832,12 +934,59 @@ if __name__ == '__main__':
         step_mode = not step_mode
         if step_mode:
           advance_requested = False
-          print("Step mode enabled. Press space to advance.")
+          print("Step mode enabled. Use '.' to advance, ',' to revisit the previous frame.")
         else:
           advance_requested = True
           print('Step mode disabled. Resuming continuous playback.')
-      elif key == ord(' ') and step_mode:
-        advance_requested = True
+      elif key == ord(',') and step_mode:
+        if history_index > 0:
+          history_index -= 1
+          frame_state = frame_history[history_index]
+          tracker.load_state(frame_state['tracker_post'])
+          advance_requested = False
+          redraw_requested = False
+        else:
+          print('Reached beginning of frame history.')
+      elif key == ord('.') and step_mode:
+        if history_index < len(frame_history) - 1:
+          history_index += 1
+          frame_state = frame_history[history_index]
+          tracker.load_state(frame_state['tracker_post'])
+          advance_requested = False
+          redraw_requested = False
+        else:
+          advance_requested = True
+      elif key in (ord('e'), ord('r')):
+        if key == ord('e'):
+          delta = -0.1
+        else:
+          delta = 0.1
+        fe.conf_thresh = float(np.clip(fe.conf_thresh * (1.0 + delta), 0.0001, 1.0))
+        opt.conf_thresh = fe.conf_thresh
+        print('Confidence threshold set to {:.4f}'.format(fe.conf_thresh))
+        if frame_state:
+          redraw_requested = True
+          advance_requested = False
+      elif key in (ord('d'), ord('f')):
+        delta = -1 if key == ord('d') else 1
+        fe.nms_dist = int(np.clip(fe.nms_dist + delta, 1, 20))
+        opt.nms_dist = fe.nms_dist
+        print('NMS distance set to {}'.format(fe.nms_dist))
+        if frame_state:
+          redraw_requested = True
+          advance_requested = False
+      elif key in (ord('t'), ord('g')):
+        delta = -0.05 if key == ord('t') else 0.05
+        fe.nn_thresh = float(np.clip(fe.nn_thresh + delta, 0.05, 1.5))
+        tracker.nn_thresh = fe.nn_thresh
+        if frame_state and 'tracker_pre' in frame_state:
+          # Ensure the cached tracker snapshot uses the updated threshold.
+          frame_state['tracker_pre']['nn_thresh'] = fe.nn_thresh
+        opt.nn_thresh = fe.nn_thresh
+        print('Match threshold set to {:.2f}'.format(fe.nn_thresh))
+        if frame_state:
+          redraw_requested = True
+          advance_requested = False
 
 
   # Close any remaining windows.
