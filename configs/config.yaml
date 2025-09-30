@@ -14,7 +14,7 @@ camid: 0                           # Camera index if using live capture
 
 # weights_path: weights/MagicLeap/superpoint_v1.pth  # BASELINE MagicLeap SuperPoint
 
-### Without mask_when_training
+### Mask: only source
 # weights_path: weights/MagicLeap/non_mask_when_training/01_ds4_th000075_nhom10_nms4_Magicleap_bs1_lr00001_th015_nms4_200000_checkpoint.pth    # MagicLeap fine-tuned
 # weights_path: weights/MagicLeap/non_mask_when_training/02_ds4_th015_nhom100_nms4_Magicleap_bs1_lr00001_th015_nms4_200000_checkpoint.pth
 # weights_path: weights/MagicLeap/non_mask_when_training/03_ds4_th015_nhom100_nms4_Magicleap_bs1_lr00001_th015_nms4_retrain_200000_checkpoint.pth
@@ -30,12 +30,17 @@ weights_path: weights/SuperpointNet/leon_esuperPointNet_400000_checkpoint.pth   
 
 # weights_path: weights/SuperpointNet_gauss2/superPointNet_gauss2_170000_checkpoint.pth #BASELINE sp-pytorch
 
-# Without mask_when_training
-# weights_path: weights/SuperpointNet_gauss2/non_mask_when_training/06_ds4_th005_nhom50_nms6_SuperpointNet_gauss2_bs16_lr0001_th005_nms6_141039_checkpoint.pth   # SuperpointNet_gauss2
+#Mask: no mask when training
+# weights_path: weights/SuperpointNet_gauss2/11_D_95000_checkpoint.pth
 
-# mask_when_training
+# Mask: only source
+# weights_path: weights/Superpointet_gauss2/non_mask_when_training/06_ds4_th005_nhom50_nms6_SuperpointNet_gauss2_bs16_lr0001_th005_nms6_141039_checkpoint.pth   # SuperpointNet_gauss2
+# weights_path: weights/SuperpointNet_gauss2/12_D_mask_only_source_55000_checkpoint.pth
+
+# Mask: source + warped
 # weights_path: weights/SuperpointNet_gauss2/mask_when_training/07_ds4_th005_nhom50_nms6_SuperpointNet_gauss2_bs16_lr0001_th005_nms6_80000_checkpoint.pth
 # weights_path: weights/SuperpointNet_gauss2/mask_when_training/08_ds4_th005_nhom50_nms6_SuperpointNet_gauss2_bs16_lr0001_th005_nms6_asmgrad_35000_checkpoint.pth
+# weights_path: weights/SuperpointNet_gauss2/13_D_th005_75000_checkpoint.pth
 
 ############################################################
 # Frame Geometry & Visualization Scaling
@@ -50,13 +55,15 @@ no_display: false                  # Disable all OpenCV UI windows
 ############################################################
 nms_dist: 4                        # Non-maximum suppression radius (pixels)
 conf_thresh: 0.015                 # SuperPoint confidence threshold
+# conf_thresh: 0.000075
 nn_thresh: 0.7                     # Descriptor match threshold for tracking
 
 ############################################################
 # Tracking Parameters
 ############################################################
 min_length: 2                      # Drop tracks shorter than this many frames
-max_length: 90                      # Sliding window length for the tracker
+# max_length: 90                      # Sliding window length for the tracker
+max_length: 10
 
 ############################################################
 # Visualization Toggles

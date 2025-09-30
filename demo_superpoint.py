@@ -711,8 +711,10 @@ if __name__ == '__main__':
   # Create a window to display the demo.
   info_win = None
   if not opt.no_display:
-    win = 'SuperPoint Tracker'
-    info_win = 'SuperPoint Help'
+    win_label = Path(opt.weights_path).name if opt.weights_path else 'SuperPoint Tracker'
+    help_label = f'{win_label} - Help' if opt.weights_path else 'SuperPoint Help'
+    win = win_label
+    info_win = help_label
     cv2.namedWindow(win)
     cv2.namedWindow(info_win, cv2.WINDOW_AUTOSIZE)
   else:
@@ -845,7 +847,10 @@ if __name__ == '__main__':
                           baseline_state: Dict[str, Any],
                           frame_label: str) -> Tuple[Dict[str, Any], float]:
     """Run detector + tracker update starting from a saved tracker state."""
+    if baseline_state and 'nn_thresh' in baseline_state:
+      baseline_state['nn_thresh'] = fe.nn_thresh
     tracker.load_state(baseline_state)
+    tracker.nn_thresh = fe.nn_thresh
     forward_start = time.time()
     pts, desc, heatmap = fe.run(current_img)
     forward_end = time.time()
@@ -921,6 +926,8 @@ if __name__ == '__main__':
         f' match thresh: {fe.nn_thresh:.2f}',
         f' frame: {frame_label}',
     ]
+    if tracks_stale:
+      status.append(' tracks view stale: replay to refresh')
 
     lines = controls + status
     panel_height = max(260, top_margin + bottom_margin + line_h * len(lines))
@@ -1220,6 +1227,7 @@ if __name__ == '__main__':
   step_mode = not opt.write and not opt.no_display
   advance_requested = True
   redraw_requested = False
+  tracks_stale = False
 
   print('==> Running Demo.')
   if not opt.no_display:
@@ -1301,18 +1309,32 @@ if __name__ == '__main__':
         if history_index > 0:
           history_index -= 1
           frame_state = frame_history[history_index]
-          tracker.load_state(frame_state['tracker_post'])
+          if 'tracker_pre' in frame_state:
+            frame_state['tracker_pre']['nn_thresh'] = fe.nn_thresh
+          if 'tracker_post' in frame_state:
+            frame_state['tracker_post']['nn_thresh'] = fe.nn_thresh
+            tracker.load_state(frame_state['tracker_post'])
+          else:
+            tracker.nn_thresh = fe.nn_thresh
+          tracker.nn_thresh = fe.nn_thresh
           advance_requested = False
-          redraw_requested = False
+          redraw_requested = True
         else:
           print('Reached beginning of frame history.')
       elif key == ord('.') and step_mode:
         if history_index < len(frame_history) - 1:
           history_index += 1
           frame_state = frame_history[history_index]
-          tracker.load_state(frame_state['tracker_post'])
+          if 'tracker_pre' in frame_state:
+            frame_state['tracker_pre']['nn_thresh'] = fe.nn_thresh
+          if 'tracker_post' in frame_state:
+            frame_state['tracker_post']['nn_thresh'] = fe.nn_thresh
+            tracker.load_state(frame_state['tracker_post'])
+          else:
+            tracker.nn_thresh = fe.nn_thresh
+          tracker.nn_thresh = fe.nn_thresh
           advance_requested = False
-          redraw_requested = False
+          redraw_requested = True
         else:
           advance_requested = True
       elif key in (ord('e'), ord('r')):
@@ -1323,6 +1345,9 @@ if __name__ == '__main__':
         fe.conf_thresh = float(np.clip(fe.conf_thresh * (1.0 + delta), 0.0001, 1.0))
         opt.conf_thresh = fe.conf_thresh
         print('Confidence threshold set to {:.4f}'.format(fe.conf_thresh))
+        if not tracks_stale:
+          print('Tracks view uses cached history; replay from start to fully refresh.')
+        tracks_stale = True
         if frame_state:
           redraw_requested = True
           advance_requested = False
@@ -1331,6 +1356,9 @@ if __name__ == '__main__':
         fe.nms_dist = int(np.clip(fe.nms_dist + delta, 1, 20))
         opt.nms_dist = fe.nms_dist
         print('NMS distance set to {}'.format(fe.nms_dist))
+        if not tracks_stale:
+          print('Tracks view uses cached history; replay from start to fully refresh.')
+        tracks_stale = True
         if frame_state:
           redraw_requested = True
           advance_requested = False
@@ -1343,6 +1371,9 @@ if __name__ == '__main__':
           frame_state['tracker_pre']['nn_thresh'] = fe.nn_thresh
         opt.nn_thresh = fe.nn_thresh
         print('Match threshold set to {:.2f}'.format(fe.nn_thresh))
+        if not tracks_stale:
+          print('Tracks view uses cached history; replay from start to fully refresh.')
+        tracks_stale = True
         if frame_state:
           redraw_requested = True
           advance_requested = False
