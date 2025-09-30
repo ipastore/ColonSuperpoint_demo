@@ -45,10 +45,13 @@
 
 
 import argparse
+import csv
 import glob
 import numpy as np
 import os
+import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -254,7 +257,7 @@ class PointTracker(object):
     self.maxl = max_length
     self.nn_thresh = nn_thresh
     self.all_pts = []
-    for n in range(self.maxl):
+    for _ in range(self.maxl):
       self.all_pts.append(np.zeros((2, 0)))
     self.last_desc = None
     self.tracks = np.zeros((0, self.maxl+2))
@@ -512,6 +515,7 @@ class VideoStreamer(object):
     self.i = 0
     self.skip = skip
     self.maxlen = 1000000
+    self.total_frames = None
     self.last_name = ''
     # If the "basedir" string is the word camera, then use a webcam.
     if basedir == "camera/" or basedir == "camera":
@@ -520,20 +524,28 @@ class VideoStreamer(object):
       self.listing = range(0, self.maxlen)
       self.camera = True
     else:
-      # Try to open as a video.
+      # Try to open as a video first.
+      input_path = Path(basedir)
       self.cap = cv2.VideoCapture(basedir)
-      lastbit = basedir[-4:len(basedir)]
-      if (type(self.cap) == list or not self.cap.isOpened()) and (lastbit == '.mp4'):
-        raise IOError('Cannot open movie file')
-      elif type(self.cap) != list and self.cap.isOpened() and (lastbit != '.txt'):
+      capture_opened = hasattr(self.cap, 'isOpened') and self.cap.isOpened()
+      is_video_file = capture_opened and (input_path.is_file() or input_path.suffix.lower() in ('.mp4', '.avi', '.mov', '.mkv'))
+
+      if is_video_file:
         print('==> Processing Video Input.')
         num_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if num_frames <= 0:
+          num_frames = self.maxlen
+          self.total_frames = None
+        else:
+          self.total_frames = num_frames
         self.listing = range(0, num_frames)
         self.listing = self.listing[::self.skip]
         self.camera = True
         self.video_file = True
-        self.maxlen = len(self.listing)
+        self.maxlen = len(self.listing) if num_frames != self.maxlen else self.maxlen
       else:
+        if capture_opened:
+          self.cap.release()
         print('==> Processing Image Directory Input.')
         search = os.path.join(basedir, img_glob)
         self.listing = glob.glob(search)
@@ -542,6 +554,7 @@ class VideoStreamer(object):
         self.maxlen = len(self.listing)
         if self.maxlen == 0:
           raise IOError('No images were found (maybe bad \'--img_glob\' parameter?)')
+        self.total_frames = self.maxlen
 
   def read_image(self, impath, img_size):
     """ Read image as grayscale and resize to img_size.
@@ -623,8 +636,8 @@ if __name__ == '__main__':
       help='Factor to scale output visualization (default: 2).')
   parser.add_argument('--min_length', type=int, default=2,
       help='Minimum length of point tracks (default: 2).')
-  parser.add_argument('--max_length', type=int, default=5,
-      help='Maximum length of point tracks (default: 5).')
+  parser.add_argument('--max_length', type=int, default=90,
+      help='Maximum length of point tracks (default: 90).')
   parser.add_argument('--show_keypoints', action='store_true',
       help='Show detected keypoints that are not currently tracked (default: False).')
   parser.add_argument('--nms_dist', type=int, default=4,
@@ -643,6 +656,10 @@ if __name__ == '__main__':
       help='Use Apple Metal Performance Shaders backend (default: False).')
   parser.add_argument('--no_display', action='store_true',
       help='Do not display images to screen. Useful if running remotely (default: False).')
+  parser.add_argument('--report', action='store_true',
+      help='When used with --no_display, generate a metrics report (default: False).')
+  parser.add_argument('--report_name', type=str, default='report',
+      help='Name prefix for the report folder under ./reports (default: report).')
   parser.add_argument('--write', action='store_true',
       help='Save output frames to a directory (default: False)')
   parser.add_argument('--write_dir', type=str, default='tracker_outputs/',
@@ -666,6 +683,8 @@ if __name__ == '__main__':
     mps_backend = getattr(torch.backends, 'mps', None)
     if mps_backend is None or not mps_backend.is_available():
       parser.error('MPS backend requested but not available in this PyTorch build.')
+  if opt.report and not opt.no_display:
+    parser.error('--report requires --no_display')
   if not opt.input:
     parser.error('No input specified. Provide a source on the command line or in the YAML config via "input".')
   print(opt)
@@ -728,6 +747,41 @@ if __name__ == '__main__':
         print('==> Saved config snapshot to %s' % config_copy_path)
       else:
         print('==> Config file not found, skipping copy: {}'.format(config_path))
+
+  report_enabled = opt.no_display and opt.report
+  report_rows: List[Dict[str, Any]] = []
+  keypoint_counts: List[int] = []
+  keypoint_conf_all: List[float] = []
+  tracked_confidences_all: List[float] = []
+  tracked_scores_for_corr: List[float] = []
+  track_counts: List[int] = []
+  track_lengths_all: List[int] = []
+  track_scores_all: List[float] = []
+  untracked_ratios: List[float] = []
+  forward_times_ms: List[float] = []
+  total_times_ms: List[float] = []
+  track_stats: Dict[int, Dict[str, float]] = {}
+
+  timestamp = time.strftime('%Y%m%d-%H%M%S')
+  report_name = None
+  if report_enabled:
+    base_report_dir = Path('reports')
+    base_report_dir.mkdir(parents=True, exist_ok=True)
+    label = (opt.report_name or 'report').strip()
+    if not label:
+      label = 'report'
+    label = label.replace(' ', '_')
+    label = Path(label).name
+    report_dir = base_report_dir / f'{label}_{timestamp}'
+    suffix = 1
+    while report_dir.exists():
+      report_dir = base_report_dir / f'{label}_{timestamp}_{suffix:02d}'
+      suffix += 1
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+  report_total_frames = vs.total_frames if report_enabled else None
+  progress_bar_width = 30
+  progress_state = {'last_fraction': -1.0}
 
   def build_visualization(frame_state: Dict[str, Any], draw_keypoints: bool) -> np.ndarray:
     """Create visualization mosaics using cached frame data.
@@ -801,6 +855,22 @@ if __name__ == '__main__':
     render_mask = get_untracked_points_mask(pts, tracks, tracker)
     untracked_pts = pts[:, render_mask]
 
+    raw_track_scores = tracks[:, 1].copy() if tracks.size != 0 else np.zeros((0,))
+    track_lengths = np.sum(tracks[:, 2:] != -1, axis=1) if tracks.size != 0 else np.zeros((0,))
+    track_ids = tracks[:, 0].astype(int) if tracks.size != 0 else np.zeros((0,), dtype=int)
+
+    tracked_confidences = np.zeros((0,))
+    tracked_scores = np.zeros((0,))
+    if tracks.size != 0 and pts.shape[1] != 0:
+      offsets = tracker.get_offsets()
+      if offsets.size != 0:
+        current_offset = offsets[-1]
+        local_indices = tracks[:, -1].astype(int) - current_offset
+        valid_mask = (local_indices >= 0) & (local_indices < pts.shape[1])
+        if np.any(valid_mask):
+          tracked_confidences = pts[2, local_indices[valid_mask]]
+          tracked_scores = raw_track_scores[valid_mask]
+
     tracks_to_draw = tracks.copy()
     if tracks_to_draw.size != 0:
       tracks_to_draw[:, 1] /= float(fe.nn_thresh)
@@ -813,6 +883,11 @@ if __name__ == '__main__':
         'tracks': tracks_to_draw,
         'tracker_pre': baseline_state,
         'frame_name': frame_label,
+        'track_scores_raw': raw_track_scores,
+        'track_lengths': track_lengths,
+        'track_ids': track_ids,
+        'tracked_confidences': tracked_confidences,
+        'tracked_scores': tracked_scores,
     }
     updated_state['tracker_post'] = tracker.save_state()
     return updated_state, float(forward_end - forward_start)
@@ -857,6 +932,288 @@ if __name__ == '__main__':
                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, lineType=16)
     return panel
 
+  def record_frame_metrics(frame_state: Dict[str, Any],
+                           forward_time: float,
+                           total_time: float) -> None:
+    if not report_enabled:
+      return
+    frame_idx = len(report_rows)
+    frame_label = frame_state['frame_name']
+    pts = frame_state['pts']
+    num_keypoints = int(pts.shape[1])
+    confidences = pts[2, :] if num_keypoints > 0 else np.zeros((0,))
+    num_tracks = int(frame_state['track_lengths'].size)
+    track_lengths_arr = frame_state['track_lengths']
+    track_scores_arr = frame_state['track_scores_raw']
+    tracked_conf_arr = frame_state['tracked_confidences']
+    tracked_scores_arr = frame_state['tracked_scores']
+    untracked_pts = frame_state['untracked_pts']
+    untracked_ratio = float(untracked_pts.shape[1]) / num_keypoints if num_keypoints > 0 else 0.0
+
+    frame_metrics: Dict[str, Any] = {
+        'frame_idx': frame_idx,
+        'frame': frame_label,
+        'num_keypoints': num_keypoints,
+        'keypoint_conf_mean': float(confidences.mean()) if confidences.size else 0.0,
+        'keypoint_conf_std': float(confidences.std()) if confidences.size else 0.0,
+        'keypoint_conf_min': float(confidences.min()) if confidences.size else 0.0,
+        'keypoint_conf_max': float(confidences.max()) if confidences.size else 0.0,
+        'keypoint_conf_median': float(np.median(confidences)) if confidences.size else 0.0,
+        'untracked_ratio': untracked_ratio,
+        'num_tracks': num_tracks,
+        'track_length_mean': float(track_lengths_arr.mean()) if track_lengths_arr.size else 0.0,
+        'track_length_std': float(track_lengths_arr.std()) if track_lengths_arr.size else 0.0,
+        'track_length_min': float(track_lengths_arr.min()) if track_lengths_arr.size else 0.0,
+        'track_length_max': float(track_lengths_arr.max()) if track_lengths_arr.size else 0.0,
+        'track_length_median': float(np.median(track_lengths_arr)) if track_lengths_arr.size else 0.0,
+        'track_score_mean': float(track_scores_arr.mean()) if track_scores_arr.size else 0.0,
+        'track_score_std': float(track_scores_arr.std()) if track_scores_arr.size else 0.0,
+        'track_score_min': float(track_scores_arr.min()) if track_scores_arr.size else 0.0,
+        'track_score_max': float(track_scores_arr.max()) if track_scores_arr.size else 0.0,
+        'track_score_median': float(np.median(track_scores_arr)) if track_scores_arr.size else 0.0,
+        'tracked_confidence_mean': float(tracked_conf_arr.mean()) if tracked_conf_arr.size else 0.0,
+        'tracked_confidence_std': float(tracked_conf_arr.std()) if tracked_conf_arr.size else 0.0,
+        'tracked_confidence_min': float(tracked_conf_arr.min()) if tracked_conf_arr.size else 0.0,
+        'tracked_confidence_max': float(tracked_conf_arr.max()) if tracked_conf_arr.size else 0.0,
+        'tracked_confidence_median': float(np.median(tracked_conf_arr)) if tracked_conf_arr.size else 0.0,
+        'forward_time_ms': float(forward_time * 1000.0),
+        'total_time_ms': float(total_time * 1000.0),
+    }
+
+    for length in range(1, opt.max_length + 1):
+      count = int(np.sum(track_lengths_arr == length)) if track_lengths_arr.size else 0
+      frame_metrics[f'tracks_len_{length}'] = count
+
+    report_rows.append(frame_metrics)
+    keypoint_counts.append(num_keypoints)
+    keypoint_conf_all.extend(confidences.tolist())
+    track_counts.append(num_tracks)
+    track_lengths_all.extend(track_lengths_arr.astype(int).tolist())
+    track_scores_all.extend(track_scores_arr.tolist())
+    tracked_confidences_all.extend(tracked_conf_arr.tolist())
+    tracked_scores_for_corr.extend(tracked_scores_arr.tolist())
+    untracked_ratios.append(untracked_ratio)
+    forward_times_ms.append(frame_metrics['forward_time_ms'])
+    total_times_ms.append(frame_metrics['total_time_ms'])
+
+    for track_id, length, score in zip(frame_state['track_ids'], track_lengths_arr, track_scores_arr):
+      track_stats[int(track_id)] = {'length': float(length), 'score': float(score)}
+
+    if report_enabled and report_total_frames and report_total_frames > 0:
+      completed = frame_idx + 1
+      fraction = min(1.0, completed / float(report_total_frames))
+      last_fraction = progress_state['last_fraction']
+      if fraction - last_fraction >= (1.0 / report_total_frames) or fraction >= 1.0:
+        filled = int(round(fraction * progress_bar_width))
+        bar = '#' * filled + '-' * (progress_bar_width - filled)
+        sys.stdout.write(f'\rReport progress: [{bar}] {fraction*100:5.1f}% ({completed}/{report_total_frames})')
+        sys.stdout.flush()
+        progress_state['last_fraction'] = fraction
+      if fraction >= 1.0:
+        sys.stdout.write('\n')
+
+  def _basic_stats(values: List[float]) -> Dict[str, float]:
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+      return {'mean': float('nan'), 'std': float('nan'), 'min': float('nan'),
+              'max': float('nan'), 'median': float('nan')}
+    return {
+        'mean': float(arr.mean()),
+        'std': float(arr.std()),
+        'min': float(arr.min()),
+        'max': float(arr.max()),
+        'median': float(np.median(arr)),
+    }
+
+  def finalize_report() -> None:
+    if not report_enabled:
+      return
+    if not report_rows:
+      print('Report requested but no frames processed; skipping report generation.')
+      return
+
+    metrics_csv = report_dir / 'metrics.csv'
+    length_fields = [f'tracks_len_{length}' for length in range(1, opt.max_length + 1)]
+    csv_fields = ['frame_idx', 'frame', 'num_keypoints', 'keypoint_conf_mean',
+                  'keypoint_conf_std', 'keypoint_conf_min', 'keypoint_conf_max',
+                  'keypoint_conf_median', 'untracked_ratio', 'num_tracks',
+                  'track_length_mean', 'track_length_std', 'track_length_min',
+                  'track_length_max', 'track_length_median', 'track_score_mean',
+                  'track_score_std', 'track_score_min', 'track_score_max',
+                  'track_score_median', 'tracked_confidence_mean',
+                  'tracked_confidence_std', 'tracked_confidence_min',
+                  'tracked_confidence_max', 'tracked_confidence_median',
+                  'forward_time_ms', 'total_time_ms'] + length_fields
+
+    with metrics_csv.open('w', newline='') as csvfile:
+      writer = csv.DictWriter(csvfile, fieldnames=csv_fields)
+      writer.writeheader()
+      for row in report_rows:
+        writer.writerow(row)
+
+    summary_csv = report_dir / 'summary.csv'
+    summary_rows: List[Dict[str, Any]] = []
+    summary_rows.append({'metric': 'num_keypoints', **_basic_stats(keypoint_counts)})
+    summary_rows.append({'metric': 'num_tracks', **_basic_stats(track_counts)})
+    summary_rows.append({'metric': 'track_length', **_basic_stats(track_lengths_all)})
+    summary_rows.append({'metric': 'track_score', **_basic_stats(track_scores_all)})
+    summary_rows.append({'metric': 'keypoint_confidence', **_basic_stats(keypoint_conf_all)})
+    summary_rows.append({'metric': 'tracked_confidence', **_basic_stats(tracked_confidences_all)})
+    summary_rows.append({'metric': 'untracked_ratio', **_basic_stats(untracked_ratios)})
+    summary_rows.append({'metric': 'forward_time_ms', **_basic_stats(forward_times_ms)})
+    summary_rows.append({'metric': 'total_time_ms', **_basic_stats(total_times_ms)})
+
+    corr_value = float('nan')
+    if len(tracked_confidences_all) > 1 and len(tracked_scores_for_corr) == len(tracked_confidences_all):
+      corr_matrix = np.corrcoef(tracked_confidences_all, tracked_scores_for_corr)
+      if corr_matrix.shape == (2, 2):
+        corr_value = float(corr_matrix[0, 1])
+    summary_rows.append({'metric': 'confidence_match_score_correlation',
+                         'mean': corr_value})
+
+    with summary_csv.open('w', newline='') as csvfile:
+      fieldnames = ['metric', 'mean', 'std', 'min', 'max', 'median']
+      writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+      writer.writeheader()
+      for row in summary_rows:
+        writer.writerow(row)
+
+    track_length_counts = Counter(int(stat['length']) for stat in track_stats.values())
+    track_lengths_csv = report_dir / 'track_length_distribution.csv'
+    with track_lengths_csv.open('w', newline='') as csvfile:
+      writer = csv.writer(csvfile)
+      writer.writerow(['length', 'count'])
+      for length in sorted(track_length_counts):
+        writer.writerow([length, track_length_counts[length]])
+
+    track_scores_csv = report_dir / 'track_scores.csv'
+    with track_scores_csv.open('w', newline='') as csvfile:
+      writer = csv.writer(csvfile)
+      writer.writerow(['track_id', 'average_score'])
+      for track_id, stats in sorted(track_stats.items()):
+        writer.writerow([track_id, stats['score']])
+
+    try:
+      import matplotlib
+      matplotlib.use('Agg')
+      import matplotlib.pyplot as plt
+    except ImportError:
+      print('matplotlib not available; skipping plot generation.')
+      return
+
+    def _save_plot(fig, name: str) -> None:
+      output_path = report_dir / name
+      fig.savefig(output_path, bbox_inches='tight')
+      plt.close(fig)
+
+    frames = [row['frame_idx'] for row in report_rows]
+    keypoints_per_frame = [row['num_keypoints'] for row in report_rows]
+    if keypoints_per_frame:
+      fig, ax = plt.subplots()
+      ax.plot(frames, keypoints_per_frame, marker='o')
+      ax.set_xlabel('Frame Index')
+      ax.set_ylabel('Keypoints')
+      ax.set_title('Keypoints per Frame')
+      _save_plot(fig, 'keypoints_per_frame.png')
+
+    if keypoint_conf_all:
+      values = np.asarray(keypoint_conf_all)
+      weights = np.ones_like(values, dtype=float) / values.size
+      fig = plt.figure()
+      gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.05)
+      ax_hist = fig.add_subplot(gs[0])
+      ax_box = fig.add_subplot(gs[1], sharex=ax_hist)
+      ax_hist.hist(values, bins=40, weights=weights, color='steelblue')
+      ax_hist.set_ylabel('Fraction')
+      ax_hist.set_title('Keypoint Confidence Distribution')
+      ax_hist.text(0.98, 0.85, f'n={values.size}', transform=ax_hist.transAxes,
+                   ha='right', va='top', fontsize=8, color='dimgray')
+      ax_box.boxplot(values, vert=False, showmeans=True, patch_artist=True,
+                     boxprops={'facecolor': 'lavender'}, meanprops={'color': 'firebrick'})
+      ax_box.set_yticks([])
+      ax_box.set_xlabel('Confidence')
+      ax_box.grid(axis='x', linestyle='--', alpha=0.3)
+      plt.setp(ax_hist.get_xticklabels(), visible=False)
+      _save_plot(fig, 'keypoint_confidence_hist.png')
+
+    if track_lengths_all:
+      lengths = np.asarray(track_lengths_all)
+      weights = np.ones_like(lengths, dtype=float) / lengths.size
+      bins = range(1, int(max(lengths)) + 2)
+      fig = plt.figure()
+      gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.05)
+      ax_hist = fig.add_subplot(gs[0])
+      ax_box = fig.add_subplot(gs[1], sharex=ax_hist)
+      ax_hist.hist(lengths, bins=bins, weights=weights, align='left', rwidth=0.8)
+      ax_hist.set_ylabel('Fraction')
+      ax_hist.set_title('Track Length Distribution')
+      ax_hist.text(0.98, 0.85, f'n={lengths.size}', transform=ax_hist.transAxes,
+                   ha='right', va='top', fontsize=8, color='dimgray')
+      ax_box.boxplot(lengths, vert=False, showmeans=True, patch_artist=True,
+                     boxprops={'facecolor': 'mistyrose'}, meanprops={'color': 'firebrick'})
+      ax_box.set_yticks([])
+      ax_box.set_xlabel('Track Length')
+      ax_box.grid(axis='x', linestyle='--', alpha=0.3)
+      plt.setp(ax_hist.get_xticklabels(), visible=False)
+      _save_plot(fig, 'track_length_hist.png')
+
+    if track_scores_all:
+      scores = np.asarray(track_scores_all)
+      weights = np.ones_like(scores, dtype=float) / scores.size
+      fig = plt.figure()
+      gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.05)
+      ax_hist = fig.add_subplot(gs[0])
+      ax_box = fig.add_subplot(gs[1], sharex=ax_hist)
+      ax_hist.hist(scores, bins=40, weights=weights, color='seagreen')
+      ax_hist.set_ylabel('Fraction')
+      ax_hist.set_title('Track Match Score Distribution')
+      ax_hist.text(0.98, 0.85, f'n={scores.size}', transform=ax_hist.transAxes,
+                   ha='right', va='top', fontsize=8, color='dimgray')
+      ax_box.boxplot(scores, vert=False, showmeans=True, patch_artist=True,
+                     boxprops={'facecolor': 'honeydew'}, meanprops={'color': 'firebrick'})
+      ax_box.set_yticks([])
+      ax_box.set_xlabel('Average Match Score')
+      ax_box.grid(axis='x', linestyle='--', alpha=0.3)
+      plt.setp(ax_hist.get_xticklabels(), visible=False)
+      _save_plot(fig, 'track_score_hist.png')
+
+    if untracked_ratios:
+      fig, ax = plt.subplots()
+      ax.plot(frames, untracked_ratios, marker='x', color='darkorange')
+      ax.set_xlabel('Frame Index')
+      ax.set_ylabel('Untracked Ratio')
+      ax.set_title('Untracked Keypoint Ratio per Frame')
+      _save_plot(fig, 'untracked_ratio_per_frame.png')
+
+    config_snapshot = {
+        'run': {
+            'timestamp': timestamp,
+            'input': opt.input,
+            'weights_path': opt.weights_path,
+            'model': opt.model,
+            'total_frames_expected': report_total_frames,
+            'frames_processed': len(report_rows),
+        },
+        'thresholds': {
+            'conf_thresh': opt.conf_thresh,
+            'nms_dist': opt.nms_dist,
+            'nn_thresh': opt.nn_thresh,
+            'min_track_length': opt.min_length,
+            'max_track_length': opt.max_length,
+        },
+        'report': {
+            'enabled': report_enabled,
+            'output_dir': str(report_dir),
+            'metrics_csv': 'metrics.csv',
+            'summary_csv': 'summary.csv',
+            'track_length_distribution_csv': 'track_length_distribution.csv',
+            'track_scores_csv': 'track_scores.csv',
+        }
+    }
+
+    config_path = report_dir / 'report_config.yaml'
+    config_path.write_text(yaml.dump(config_snapshot, sort_keys=True), encoding='utf-8')
+
   frame_state: Dict[str, Any] = {}
   frame_history: List[Dict[str, Any]] = []
   history_index = -1
@@ -900,6 +1257,8 @@ if __name__ == '__main__':
       if opt.show_extra:
         print('Processed image %d (net+post_process: %.2f FPS, total: %.2f FPS).' %
               (vs.i, net_t, total_t))
+
+      record_frame_metrics(frame_state, forward_time, end - start)
 
       advance_requested = not step_mode
       redraw_requested = False
@@ -991,5 +1350,7 @@ if __name__ == '__main__':
 
   # Close any remaining windows.
   cv2.destroyAllWindows()
+
+  finalize_report()
 
   print('==> Finshed Demo.')

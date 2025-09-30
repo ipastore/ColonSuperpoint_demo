@@ -5,3 +5,4 @@ assets/*
 __pycache__/
 .DS_Store
 tracker_outputs/
+reports/
