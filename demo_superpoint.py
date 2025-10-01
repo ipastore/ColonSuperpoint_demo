@@ -53,7 +53,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import torch
@@ -1228,6 +1228,8 @@ if __name__ == '__main__':
   advance_requested = True
   redraw_requested = False
   tracks_stale = False
+  video_complete = False
+  out: Optional[np.ndarray] = None
 
   print('==> Running Demo.')
   if not opt.no_display:
@@ -1241,35 +1243,47 @@ if __name__ == '__main__':
       start = time.time()
       img, status = vs.next_frame()
       if status is False:
-        break
+        if not frame_history:
+          print('No frames available from input; exiting.')
+          break
+        if not video_complete:
+          print('Reached end of frame history.')
+        video_complete = True
+        advance_requested = False
+        redraw_requested = False
+        if opt.no_display:
+          break
+      else:
+        video_complete = False
 
-      baseline_state = tracker.save_state()
-      frame_label = vs.last_name or 'frame_%06d' % max(vs.i - 1, 0)
-      frame_state, forward_time = run_superpoint_pass(img, baseline_state, frame_label)
-      if history_index < len(frame_history) - 1:
-        frame_history[:] = frame_history[:history_index + 1]
-      frame_history.append(frame_state)
-      history_index = len(frame_history) - 1
-      out = build_visualization(frame_state, show_keypoints)
+      if not video_complete:
+        baseline_state = tracker.save_state()
+        frame_label = vs.last_name or 'frame_%06d' % max(vs.i - 1, 0)
+        frame_state, forward_time = run_superpoint_pass(img, baseline_state, frame_label)
+        if history_index < len(frame_history) - 1:
+          frame_history[:] = frame_history[:history_index + 1]
+        frame_history.append(frame_state)
+        history_index = len(frame_history) - 1
+        out = build_visualization(frame_state, show_keypoints)
 
-      if opt.write:
-        out_file = os.path.join(opt.write_dir, 'frame_%05d.png' % vs.i)
-        print('Writing image to %s' % out_file)
-        cv2.imwrite(out_file, out)
+        if opt.write:
+          out_file = os.path.join(opt.write_dir, 'frame_%05d.png' % vs.i)
+          print('Writing image to %s' % out_file)
+          cv2.imwrite(out_file, out)
 
-      end = time.time()
-      safe_forward = max(forward_time, 1e-6)
-      safe_total = max(end - start, 1e-6)
-      net_t = 1. / safe_forward
-      total_t = 1. / safe_total
-      if opt.show_extra:
-        print('Processed image %d (net+post_process: %.2f FPS, total: %.2f FPS).' %
-              (vs.i, net_t, total_t))
+        end = time.time()
+        safe_forward = max(forward_time, 1e-6)
+        safe_total = max(end - start, 1e-6)
+        net_t = 1. / safe_forward
+        total_t = 1. / safe_total
+        if opt.show_extra:
+          print('Processed image %d (net+post_process: %.2f FPS, total: %.2f FPS).' %
+                (vs.i, net_t, total_t))
 
-      record_frame_metrics(frame_state, forward_time, end - start)
+        record_frame_metrics(frame_state, forward_time, end - start)
 
-      advance_requested = not step_mode
-      redraw_requested = False
+        advance_requested = not step_mode and not video_complete
+        redraw_requested = False
     else:
       if not frame_state:
         advance_requested = True
@@ -1280,7 +1294,7 @@ if __name__ == '__main__':
                                              frame_state['frame_name'])
         frame_history[history_index] = frame_state
         redraw_requested = False
-        advance_requested = not step_mode
+        advance_requested = not step_mode and not video_complete
       out = build_visualization(frame_state, show_keypoints)
 
     if not opt.no_display:
@@ -1303,7 +1317,7 @@ if __name__ == '__main__':
           advance_requested = False
           print("Step mode enabled. Use '.' to advance, ',' to revisit the previous frame.")
         else:
-          advance_requested = True
+          advance_requested = not video_complete
           print('Step mode disabled. Resuming continuous playback.')
       elif key == ord(',') and step_mode:
         if history_index > 0:
@@ -1336,7 +1350,7 @@ if __name__ == '__main__':
           advance_requested = False
           redraw_requested = True
         else:
-          advance_requested = True
+          advance_requested = not video_complete
       elif key in (ord('e'), ord('r')):
         if key == ord('e'):
           delta = -0.1
