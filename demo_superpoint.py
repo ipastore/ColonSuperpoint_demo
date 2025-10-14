@@ -867,8 +867,10 @@ if __name__ == '__main__':
             heatmap_vis.max() - heatmap_vis.min() + .00001)
         out3 = myjet[np.round(np.clip(heatmap_vis*10, 0, 9)).astype('int'), :]
         out3 = (out3*255).astype('uint8')
-      if out3.shape[:2] != out2.shape[:2]:
-        out3 = cv2.resize(out3, (out2.shape[1], out2.shape[0]),
+      if out3.shape[0] != out2.shape[0]:
+        scale = out2.shape[0] / float(out3.shape[0])
+        target_width = max(1, int(round(out3.shape[1] * scale)))
+        out3 = cv2.resize(out3, (target_width, out2.shape[0]),
                           interpolation=cv2.INTER_NEAREST)
     else:
       out3 = np.zeros_like(out2)
@@ -877,8 +879,12 @@ if __name__ == '__main__':
     # Resize final output.
     if opt.show_extra:
       combined = np.hstack((out1, out2, out3))
-      return cv2.resize(
-          combined, (3*opt.display_scale*opt.W, opt.display_scale*opt.H))
+      if combined.shape[0] == 0:
+        return combined
+      target_height = int(round(opt.display_scale * opt.H))
+      scale = target_height / float(combined.shape[0])
+      target_width = max(1, int(round(combined.shape[1] * scale)))
+      return cv2.resize(combined, (target_width, target_height))
     return cv2.resize(
         out1, (opt.display_scale*opt.W, opt.display_scale*opt.H))
 
