@@ -628,6 +628,10 @@ if __name__ == '__main__':
       help='Images to skip if input is movie or directory (default: 1).')
   parser.add_argument('--show_extra', action='store_true',
       help='Show extra debug outputs (default: False).')
+  parser.add_argument('--continuous_heatmap', action='store_true',
+      help='Use continuous colormap for raw heatmap probabilities (default: False).')
+  parser.add_argument('--display_cap', type=float, default=0.5,
+      help='Probability value mapped to the top of the heatmap (default: 0.5).')
   parser.add_argument('--H', type=int, default=120,
       help='Input image height (default: 120).')
   parser.add_argument('--W', type=int, default=160,
@@ -820,14 +824,49 @@ if __name__ == '__main__':
 
     # Extra output -- Show the point confidence heatmap.
     if heatmap is not None:
-      heatmap_vis = heatmap.copy()
-      min_conf = 0.001
-      heatmap_vis[heatmap_vis < min_conf] = min_conf
-      heatmap_vis = -np.log(heatmap_vis)
-      heatmap_vis = (heatmap_vis - heatmap_vis.min()) / (
-          heatmap_vis.max() - heatmap_vis.min() + .00001)
-      out3 = myjet[np.round(np.clip(heatmap_vis*10, 0, 9)).astype('int'), :]
-      out3 = (out3*255).astype('uint8')
+      if opt.continuous_heatmap:
+        display_cap = max(opt.display_cap, 1e-6)
+        heatmap_scaled = np.clip(heatmap / display_cap, 0.0, 1.0)
+        heatmap_vis = np.round(heatmap_scaled * 255.0).astype('uint8')
+        out3 = cv2.applyColorMap(heatmap_vis, cv2.COLORMAP_JET)
+        bar_height = out3.shape[0]
+        pad = 8
+        usable_height = max(1, bar_height - 2*pad)
+        gradient_body = np.linspace(display_cap, 0.0, usable_height, dtype=np.float32)[:, None]
+        gradient_scaled = np.clip(gradient_body / display_cap, 0.0, 1.0)
+        gradient_uint8 = np.zeros((bar_height, 1), dtype=np.uint8)
+        gradient_uint8[pad:pad+usable_height] = np.round(gradient_scaled * 255.0).astype('uint8')
+        if pad > 0:
+          gradient_uint8[:pad] = gradient_uint8[pad]
+          gradient_uint8[pad+usable_height:] = gradient_uint8[pad+usable_height-1]
+        bar_width = 16
+        gradient_uint8 = np.repeat(gradient_uint8, bar_width, axis=1)
+        colorbar = cv2.applyColorMap(gradient_uint8, cv2.COLORMAP_JET)
+        label_width = 90
+        label_area = np.zeros((bar_height, label_width, 3), dtype=np.uint8)
+        tick_candidates = [0.0, 0.01, 0.05, 0.1, 0.2, display_cap]
+        tick_vals = sorted({round(t, 4) for t in tick_candidates
+                            if 0.0 <= t <= display_cap})
+        for idx, val in enumerate(tick_vals):
+          y = pad + int(round(((display_cap - val) / display_cap) * max(0, usable_height - 1)))
+          y = int(np.clip(y, 0, bar_height - 1))
+          cv2.line(colorbar, (0, y), (colorbar.shape[1] - 1, y), (255, 255, 255), 1, lineType=16)
+          cv2.line(label_area, (0, y), (label_area.shape[1] - 1, y), (80, 80, 80), 1, lineType=16)
+          label = f'{val:.2f}'
+          (text_w, text_h), _ = cv2.getTextSize(label, font, font_sc, 1)
+          text_y = int(np.clip(y - 4, text_h + 2, bar_height - 2))
+          x_offset = 5 if (idx % 2 == 0) else max(5, label_width - text_w - 5)
+          cv2.putText(label_area, label, (x_offset, text_y), font, font_sc, font_clr, 1, lineType=16)
+        out3 = np.hstack((out3, colorbar, label_area))
+      else:
+        heatmap_vis = heatmap.copy()
+        min_conf = 0.001
+        heatmap_vis[heatmap_vis < min_conf] = min_conf
+        heatmap_vis = -np.log(heatmap_vis)
+        heatmap_vis = (heatmap_vis - heatmap_vis.min()) / (
+            heatmap_vis.max() - heatmap_vis.min() + .00001)
+        out3 = myjet[np.round(np.clip(heatmap_vis*10, 0, 9)).astype('int'), :]
+        out3 = (out3*255).astype('uint8')
       if out3.shape[:2] != out2.shape[:2]:
         out3 = cv2.resize(out3, (out2.shape[1], out2.shape[0]),
                           interpolation=cv2.INTER_NEAREST)
@@ -915,6 +954,7 @@ if __name__ == '__main__':
         " e/r: conf +/-",
         " d/f: NMS +/-",
         " t/g: match +/-",
+        " c/v: cap +/-",
     ]
     status = [
         '',
@@ -924,6 +964,7 @@ if __name__ == '__main__':
         f' conf thresh: {fe.conf_thresh:.4f}',
         f' nms dist: {fe.nms_dist}',
         f' match thresh: {fe.nn_thresh:.2f}',
+        f' display cap: {opt.display_cap:.2f}',
         f' frame: {frame_label}',
     ]
     if tracks_stale:
@@ -1235,6 +1276,7 @@ if __name__ == '__main__':
   if not opt.no_display:
     print("Keyboard: 'q' to quit, 'k' toggle keypoints, 's' toggle step mode.")
     print("Keyboard: 'e/r' adjust confidence, 'd/f' adjust NMS, 't/g' adjust match threshold.")
+    print("Keyboard: 'c/v' adjust display cap in 0.05 steps.")
     print("Step mode: ',' moves back, '.' advances.")
     if step_mode:
       print("Step mode is active. Use '.' to advance, ',' to revisit the previous frame.")
@@ -1391,6 +1433,16 @@ if __name__ == '__main__':
         if frame_state:
           redraw_requested = True
           advance_requested = False
+      elif key in (ord('c'), ord('v')):
+        step = 0.05
+        delta = -step if key == ord('c') else step
+        new_cap = float(np.clip(opt.display_cap + delta, 0.05, 1.0))
+        if not np.isclose(new_cap, opt.display_cap):
+          opt.display_cap = new_cap
+          print('Display cap set to {:.2f}'.format(opt.display_cap))
+          if frame_state:
+            redraw_requested = True
+            advance_requested = False
 
 
   # Close any remaining windows.

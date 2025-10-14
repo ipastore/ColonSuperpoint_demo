@@ -69,6 +69,8 @@ max_length: 10
 # Visualization Toggles
 ############################################################
 show_extra: false                  # Show additional debug panels (out2/out3)
+continuous_heatmap: false          # Use continuous colormap for raw heatmaps
+display_cap: 0.5                   # Probability value mapped to top color
 show_keypoints: false              # Draw untracked keypoints on main view
 waitkey: 1                         # OpenCV waitKey delay in ms (frame pacing)
 
