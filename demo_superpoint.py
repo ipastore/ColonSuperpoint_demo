@@ -859,18 +859,60 @@ if __name__ == '__main__':
           cv2.putText(label_area, label, (x_offset, text_y), font, font_sc, font_clr, 1, lineType=16)
         out3 = np.hstack((out3, colorbar, label_area))
       else:
-        heatmap_vis = heatmap.copy()
-        min_conf = 0.001
-        heatmap_vis[heatmap_vis < min_conf] = min_conf
-        heatmap_vis = -np.log(heatmap_vis)
-        heatmap_vis = (heatmap_vis - heatmap_vis.min()) / (
-            heatmap_vis.max() - heatmap_vis.min() + .00001)
-        out3 = myjet[np.round(np.clip(heatmap_vis*10, 0, 9)).astype('int'), :]
-        out3 = (out3*255).astype('uint8')
+        min_conf = 1.0e-3
+        num_colors = myjet.shape[0]
+        raw_max = float(np.clip(opt.display_cap, min_conf, 1.0))
+        max_conf = raw_max if raw_max > min_conf else min_conf * 1.05
+        prob_levels = np.geomspace(min_conf, max_conf, num=num_colors).astype(np.float32)
+        heatmap_clipped = np.clip(heatmap, min_conf, max_conf)
+        color_indices = np.digitize(heatmap_clipped, prob_levels, right=True)
+        color_indices = np.clip(color_indices, 0, num_colors - 1).astype('int')
+        color_indices = (num_colors - 1) - color_indices
+        heatmap_rgb = (myjet[color_indices] * 255).astype('uint8')
+        target_height = out2.shape[0]
+        if heatmap_rgb.shape[0] != target_height:
+          heatmap_rgb = cv2.resize(
+              heatmap_rgb, (heatmap_rgb.shape[1], target_height),
+              interpolation=cv2.INTER_NEAREST)
+        bar_width = 16
+        label_width = 130
+        panel_segments = [heatmap_rgb]
+        bar_height = heatmap_rgb.shape[0]
+        if bar_height > 0:
+          colorbar = np.zeros((bar_height, bar_width, 3), dtype=np.uint8)
+          label_area = np.zeros((bar_height, label_width, 3), dtype=np.uint8)
+          prob_levels_desc = prob_levels[::-1]
+          for segment_idx, color_idx in enumerate(range(num_colors)):
+            start = int(round(segment_idx * bar_height / num_colors))
+            end = int(round((segment_idx + 1) * bar_height / num_colors))
+            end = max(start + 1, end)
+            color = (myjet[color_idx] * 255).astype('uint8')
+            colorbar[start:end, :] = color
+            center_y = int(np.clip((start + end - 1) * 0.5, 0, bar_height - 1))
+            cv2.line(colorbar, (0, center_y), (bar_width - 1, center_y), (255, 255, 255), 1, lineType=16)
+            cv2.line(label_area, (0, center_y), (label_area.shape[1] - 1, center_y), (80, 80, 80), 1, lineType=16)
+            prob_val = float(prob_levels_desc[segment_idx])
+            if prob_val >= 0.1:
+              label_text = f'{prob_val:.2f}'
+            elif prob_val >= 0.01:
+              label_text = f'{prob_val:.3f}'
+            else:
+              label_text = f'{prob_val:.1e}'
+            (text_w, text_h), _ = cv2.getTextSize(label_text, font, font_sc, 1)
+            text_y = int(np.clip(center_y + text_h // 2, text_h + 1, bar_height - 2))
+            x_offset = 5 if (segment_idx % 2 == 0) else max(5, label_area.shape[1] - text_w - 5)
+            if x_offset + text_w >= label_area.shape[1]:
+              x_offset = max(1, label_area.shape[1] - text_w - 2)
+            cv2.putText(label_area, label_text, (x_offset, text_y), font, font_sc, font_clr, 1, lineType=16)
+          if colorbar.shape[0] != target_height:
+            colorbar = cv2.resize(colorbar, (bar_width, target_height),
+                                  interpolation=cv2.INTER_NEAREST)
+            label_area = cv2.resize(label_area, (label_width, target_height),
+                                     interpolation=cv2.INTER_NEAREST)
+          panel_segments.extend([colorbar, label_area])
+        out3 = np.hstack(panel_segments)
       if out3.shape[0] != out2.shape[0]:
-        scale = out2.shape[0] / float(out3.shape[0])
-        target_width = max(1, int(round(out3.shape[1] * scale)))
-        out3 = cv2.resize(out3, (target_width, out2.shape[0]),
+        out3 = cv2.resize(out3, (out3.shape[1], out2.shape[0]),
                           interpolation=cv2.INTER_NEAREST)
     else:
       out3 = np.zeros_like(out2)
