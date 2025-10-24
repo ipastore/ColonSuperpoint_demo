@@ -89,6 +89,47 @@ def maybe_rescale_keypoints(feats: dict, target_size) -> dict:
     return feats
 
 
+def _format_image_size(value):
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if hasattr(value, 'tolist'):
+        return value.tolist()
+    return value
+
+
+def debug_keypoint_stats(label: str, feats_left: dict, feats_right: dict, target_left, target_right) -> None:
+    def stats(feats):
+        if feats is None:
+            return (None, None), (None, None)
+        keypoints = feats.get('keypoints')
+        if keypoints is None:
+            return (None, None), (None, None)
+        if isinstance(keypoints, torch.Tensor):
+            keypoints = keypoints.detach().cpu().numpy()
+        else:
+            keypoints = np.asarray(keypoints)
+        if keypoints.size == 0:
+            return (None, None), (None, None)
+        return keypoints.min(axis=0), keypoints.max(axis=0)
+
+    left_min, left_max = stats(feats_left)
+    right_min, right_max = stats(feats_right)
+    left_img_size = _format_image_size(feats_left.get('image_size') if feats_left else None)
+    right_img_size = _format_image_size(feats_right.get('image_size') if feats_right else None)
+    print(
+        f"[DEBUG] {label} LEFT target={target_left} feats_size={left_img_size}"
+        f" min={left_min} max={left_max}"
+    )
+    print(
+        f"[DEBUG] {label} RIGHT target={target_right} feats_size={right_img_size}"
+        f" min={right_min} max={right_max}"
+    )
+
+
 def load_sift_bin(path, image_size):
     with open(path, 'rb') as f:
         (N,) = struct.unpack('<I', f.read(4))
@@ -184,7 +225,7 @@ class SuperPointFromWeights(Extractor):
                 keypoints.append(scores.new_zeros((0, 2)))
                 keypoint_scores.append(scores.new_zeros((0,)))
                 continue
-            kp = torch.stack([xs, ys], dim=-1)
+            kp = torch.stack([ys, xs], dim=-1)
             sc = scores[i, ys, xs]
             if self.conf.max_num_keypoints is not None:
                 kp, sc = top_k_keypoints(kp, sc, self.conf.max_num_keypoints)
@@ -264,6 +305,9 @@ for entry in os.scandir(matching_folder):
         # load images
         image0 = load_image(img_path0).to(DEVICE)
         image1 = load_image(img_path1).to(DEVICE)
+        print(f"[DEBUG] image0 tensor shape={tuple(image0.shape)} image1 tensor shape={tuple(image1.shape)}")
+        image0_np = image0.permute(1, 2, 0).cpu().numpy()
+        image1_np = image1.permute(1, 2, 0).cpu().numpy()
 
         print(f"Matching {img_path0} and {img_path1}")
 
@@ -361,10 +405,14 @@ for entry in os.scandir(matching_folder):
         fig, axes = plt.subplots(num_rows, 2, figsize=(12, 4 * num_rows))
         axes = np.atleast_2d(axes)
 
-        def prep_axes(row_idx):
+        def prep_axes(row_idx, label):
             left, right = axes[row_idx, 0], axes[row_idx, 1]
-            left.imshow(image0.permute(1, 2, 0).cpu().numpy())
-            right.imshow(image1.permute(1, 2, 0).cpu().numpy())
+            left.imshow(image0_np)
+            right.imshow(image1_np)
+            print(
+                f"[DEBUG] row={label} plotted_left_shape={image0_np.shape}"
+                f" plotted_right_shape={image1_np.shape}"
+            )
             for ax_ in (left, right):
                 ax_.get_yaxis().set_ticks([])
                 ax_.get_xaxis().set_ticks([])
@@ -374,7 +422,7 @@ for entry in os.scandir(matching_folder):
             return left, right
 
         # Row 0: SIFT+LG
-        ax_left, ax_right = prep_axes(0)
+        ax_left, ax_right = prep_axes(0, 'SIFT')
         n0 = sift_feats0['keypoints'].shape[0]
         n1 = sift_feats1['keypoints'].shape[0]
         matched0 = torch.zeros(n0, dtype=torch.bool)
@@ -389,13 +437,14 @@ for entry in os.scandir(matching_folder):
             p1_ab = torch.empty((0, 2))
         nm_kpts0 = sift_feats0['keypoints'][~matched0]
         nm_kpts1 = sift_feats1['keypoints'][~matched1]
+        debug_keypoint_stats('SIFT', sift_feats0, sift_feats1, target_size_left, target_size_right)
         viz2d.plot_keypoints([nm_kpts0, nm_kpts1], colors="yellow", ps=2, axes=(ax_left, ax_right))
         if p0_ab.numel() > 0:
             viz2d.plot_matches(p0_ab, p1_ab, color="lime", lw=0.2, axes=(ax_left, ax_right))
         viz2d.add_text(0, f"SIFT+{matcher_label}: {p0_ab.shape[0]} matches", fs=16)
 
         # Row 1: CudaSIFT+LG
-        ax_left_cuda, ax_right_cuda = prep_axes(1)
+        ax_left_cuda, ax_right_cuda = prep_axes(1, 'CudaSIFT')
         n0b = feats0_bin['keypoints'].shape[0]
         n1b = feats1_bin['keypoints'].shape[0]
         matched0b = torch.zeros(n0b, dtype=torch.bool)
@@ -410,6 +459,7 @@ for entry in os.scandir(matching_folder):
             points1_bin = torch.empty((0, 2))
         nm_kpts0b = feats0_bin['keypoints'][~matched0b]
         nm_kpts1b = feats1_bin['keypoints'][~matched1b]
+        debug_keypoint_stats('CudaSIFT', feats0_bin, feats1_bin, target_size_left, target_size_right)
         viz2d.plot_keypoints([nm_kpts0b, nm_kpts1b], colors="yellow", ps=2, axes=(ax_left_cuda, ax_right_cuda))
         if points0_bin.numel() > 0:
             viz2d.plot_matches(points0_bin, points1_bin, color="lime", lw=0.2, axes=(ax_left_cuda, ax_right_cuda))
@@ -417,7 +467,7 @@ for entry in os.scandir(matching_folder):
 
         if sp_results is not None:
             feats0_sp, feats1_sp, matches_sp = sp_results
-            ax_left_sp, ax_right_sp = prep_axes(2)
+            ax_left_sp, ax_right_sp = prep_axes(2, 'SuperPoint')
             n0_sp = feats0_sp['keypoints'].shape[0]
             n1_sp = feats1_sp['keypoints'].shape[0]
             matched0_sp = torch.zeros(n0_sp, dtype=torch.bool)
@@ -440,6 +490,7 @@ for entry in os.scandir(matching_folder):
                 sp_match_count = 0
             nm_kpts0_sp = feats0_sp['keypoints'][~matched0_sp]
             nm_kpts1_sp = feats1_sp['keypoints'][~matched1_sp]
+            debug_keypoint_stats('SuperPoint', feats0_sp, feats1_sp, target_size_left, target_size_right)
             viz2d.plot_keypoints(
                 [nm_kpts0_sp, nm_kpts1_sp],
                 colors="yellow",
