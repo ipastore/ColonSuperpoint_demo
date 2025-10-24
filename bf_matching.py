@@ -1,13 +1,31 @@
-from utils.LightGlue.lightglue import LightGlue, SIFT
-from utils.LightGlue.lightglue.utils import load_image, rbd
-from utils.LightGlue.lightglue.utils import match_pair
-from utils.LightGlue.lightglue import viz2d
-import matplotlib.pyplot as plt
 import os
-from itertools import combinations
-import numpy as np
 import struct
+from itertools import combinations
+
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
+import torch.nn.functional as F
+
+from models import build_superpoint_model
+from utils.LightGlue.lightglue import LightGlue, SIFT
+from utils.LightGlue.lightglue import viz2d
+from utils.LightGlue.lightglue.superpoint import (
+    sample_descriptors,
+    simple_nms,
+    top_k_keypoints,
+)
+from utils.LightGlue.lightglue.utils import Extractor, load_image, match_pair, rbd
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+SUPERPOINT_MODEL_NAME = "MagicLeap"  # e.g. "MagicLeap", "SuperpointNet", "SuperpointNet_gauss2"
+SUPERPOINT_WEIGHTS_PATH = "./weights/MagicLeap/superpoint_v1.pth"  
+
+# e.g. "./weights/magicleap_superpoint.pth"
+SUPERPOINT_MAX_KEYPOINTS = 2048
+SUPERPOINT_DETECTION_THRESHOLD = 0.015
+SUPERPOINT_MATCH_COLOR = 'lime'
+
 
 def load_sift_bin(path, image_size):
     with open(path, 'rb') as f:
@@ -16,18 +34,18 @@ def load_sift_bin(path, image_size):
         rec = 4 + 128  # x,y,scale,orientation + 128-d desc
         data = np.fromfile(f, dtype=np.float32, count=N*rec).reshape(N, rec)
     keypoints = (
-        torch.from_numpy(data[:, :2].copy()).to(dtype=torch.float32).unsqueeze(0).cuda()
+        torch.from_numpy(data[:, :2].copy()).to(dtype=torch.float32).unsqueeze(0).to(DEVICE)
     )  # (1, N, 2)
     scales = (
-        torch.from_numpy(data[:, 2].copy()).to(dtype=torch.float32).unsqueeze(0).cuda()
+        torch.from_numpy(data[:, 2].copy()).to(dtype=torch.float32).unsqueeze(0).to(DEVICE)
     )  # (1, N)
     # convert orientations from degrees to radians using numpy, then to torch
     oris_np = np.deg2rad(data[:, 3].copy())
     oris = (
-        torch.from_numpy(oris_np).to(dtype=torch.float32).unsqueeze(0).cuda()
+        torch.from_numpy(oris_np).to(dtype=torch.float32).unsqueeze(0).to(DEVICE)
     )  # (1, N)
     descriptors = (
-        torch.from_numpy(data[:, 4:].copy()).to(dtype=torch.float32).unsqueeze(0).cuda()
+        torch.from_numpy(data[:, 4:].copy()).to(dtype=torch.float32).unsqueeze(0).to(DEVICE)
     )  # (1, N, 128)
     # Normalize image_size to (1, 2)
     if isinstance(image_size, torch.Tensor):
@@ -36,7 +54,7 @@ def load_sift_bin(path, image_size):
             image_size_t = image_size_t.unsqueeze(0)
     else:
         image_size_t = torch.tensor(image_size, dtype=torch.float32).unsqueeze(0)
-    image_size_t = image_size_t.cuda()
+    image_size_t = image_size_t.to(DEVICE)
     features = {
         'keypoints': keypoints,
         'scales': scales,
@@ -47,8 +65,108 @@ def load_sift_bin(path, image_size):
     return features
 
 
-extractor_sift = SIFT(max_num_keypoints=2048, backend='opencv', detection_threshold=0.0000667).eval().cuda()  # load the extractor
-matcher_sift = LightGlue(features='sift', depth_confidence=-1, width_confidence=-1).eval().cuda()  # load the matcher
+class SuperPointFromWeights(Extractor):
+    """Minimal LightGlue-compatible extractor wrapping repository SuperPoint models."""
+
+    default_conf = {
+        'descriptor_dim': 256,
+        'nms_radius': 4,
+        'max_num_keypoints': 2048,
+        'detection_threshold': 0.0005,
+        'remove_borders': 4,
+    }
+    preprocess_conf = {'resize': 1024}
+    required_data_keys = ['image']
+
+    def __init__(
+        self,
+        model_name: str,
+        weights_path: str,
+        device: torch.device = None,
+        **conf,
+    ) -> None:
+        super().__init__(**conf)
+        self.model_name = model_name
+        self.device = torch.device(device or DEVICE)
+        self.net = build_superpoint_model(model_name, weights_path, self.device)
+        self.net.eval()
+
+    @torch.no_grad()
+    def forward(self, data: dict) -> dict:
+        image = data['image']
+        if image.device != self.device:
+            image = image.to(self.device)
+        if image.shape[1] == 3:
+            raise ValueError('SuperPointFromWeights expects grayscale images with 1 channel.')
+
+        logits, dense_descriptors = self.net(image)
+        scores = torch.softmax(logits, dim=1)[:, :-1]
+        batch, _, h, w = scores.shape
+        scores = scores.permute(0, 2, 3, 1).reshape(batch, h, w, 8, 8)
+        scores = scores.permute(0, 1, 3, 2, 4).reshape(batch, h * 8, w * 8)
+        scores = simple_nms(scores, self.conf.nms_radius)
+
+        if self.conf.remove_borders:
+            pad = self.conf.remove_borders
+            scores[:, :pad] = -1
+            scores[:, :, :pad] = -1
+            scores[:, -pad:] = -1
+            scores[:, :, -pad:] = -1
+
+        keypoints = []
+        keypoint_scores = []
+        for i in range(batch):
+            ys, xs = torch.where(scores[i] > self.conf.detection_threshold)
+            if ys.numel() == 0:
+                keypoints.append(scores.new_zeros((0, 2)))
+                keypoint_scores.append(scores.new_zeros((0,)))
+                continue
+            kp = torch.stack([xs, ys], dim=-1)
+            sc = scores[i, ys, xs]
+            if self.conf.max_num_keypoints is not None:
+                kp, sc = top_k_keypoints(kp, sc, self.conf.max_num_keypoints)
+            keypoints.append(kp.float())
+            keypoint_scores.append(sc)
+
+        keypoints = [torch.flip(k, [1]) for k in keypoints]
+        dense_descriptors = F.normalize(dense_descriptors, p=2, dim=1, eps=1e-8)
+        descriptors = [
+            sample_descriptors(k[None], dense_descriptors[i][None], 8)[0]
+            for i, k in enumerate(keypoints)
+        ]
+
+        return {
+            'keypoints': torch.stack(keypoints, 0),
+            'keypoint_scores': torch.stack(keypoint_scores, 0),
+            'descriptors': torch.stack(descriptors, 0).transpose(-1, -2).contiguous(),
+        }
+
+extractor_sift = SIFT(
+    max_num_keypoints=2048,
+    backend='opencv',
+    detection_threshold=0.0000667,
+).eval().to(DEVICE)
+matcher_sift = LightGlue(
+    features='sift',
+    depth_confidence=-1,
+    width_confidence=-1,
+).eval().to(DEVICE)
+
+superpoint_extractor = None
+matcher_superpoint = None
+if SUPERPOINT_MODEL_NAME and SUPERPOINT_WEIGHTS_PATH:
+    superpoint_extractor = SuperPointFromWeights(
+        SUPERPOINT_MODEL_NAME,
+        SUPERPOINT_WEIGHTS_PATH,
+        device=DEVICE,
+        max_num_keypoints=SUPERPOINT_MAX_KEYPOINTS,
+        detection_threshold=SUPERPOINT_DETECTION_THRESHOLD,
+    ).eval()
+    matcher_superpoint = LightGlue(
+        features='superpoint',
+        depth_confidence=-1,
+        width_confidence=-1,
+    ).eval().to(DEVICE)
 
 matching_folder = './assets/matching/examples'
 output_folder = './matching_outputs'
@@ -76,8 +194,8 @@ for entry in os.scandir(matching_folder):
 
     for img_path0, img_path1 in combinations(images, 2):
         # load images
-        image0 = load_image(img_path0).cuda()
-        image1 = load_image(img_path1).cuda()
+        image0 = load_image(img_path0).to(DEVICE)
+        image1 = load_image(img_path1).to(DEVICE)
 
         print(f"Matching {img_path0} and {img_path1}")
 
@@ -135,7 +253,38 @@ for entry in os.scandir(matching_folder):
         # plot matched keypoints and lines (extractor) in lime
         viz2d.plot_matches(p0_ab, p1_ab, color="lime", lw=0.2, axes=(ax_left_ab, ax_right_ab))
         viz2d.add_text(0, f"SIFT+LG: {len(p0_ab)} matches", fs=16)
-        
+
+        if superpoint_extractor is not None and matcher_superpoint is not None:
+            feats0_sp, feats1_sp, matches01_sp = match_pair(
+                superpoint_extractor,
+                matcher_superpoint,
+                image0,
+                image1,
+            )
+            matches_sp = matches01_sp['matches']
+            if matches_sp.ndim == 1:
+                matches_sp = matches_sp.reshape(-1, 2)
+            if matches_sp.numel() > 0:
+                p0_sp = feats0_sp['keypoints'][matches_sp[..., 0]]
+                p1_sp = feats1_sp['keypoints'][matches_sp[..., 1]]
+                viz2d.plot_matches(
+                    p0_sp,
+                    p1_sp,
+                    color=SUPERPOINT_MATCH_COLOR,
+                    lw=0.2,
+                    axes=(ax_left_ab, ax_right_ab),
+                )
+                sp_match_count = p0_sp.shape[0]
+            else:
+                sp_match_count = 0
+            viz2d.add_text(
+                0,
+                f"{SUPERPOINT_MODEL_NAME}+LG: {sp_match_count} matches",
+                pos=(0.01, 0.87),
+                fs=16,
+                color=SUPERPOINT_MATCH_COLOR,
+            )
+
         # Row 1: B->A direction
         ax_left_ab = axes[1, 0]
         ax_right_ab = axes[1, 1]
