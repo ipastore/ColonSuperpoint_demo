@@ -1,4 +1,3 @@
-utils/
 assets/*
 !assets/Seq_035_b_subset/
 !assets/Seq_035_b_subset/*.png
