@@ -64,6 +64,31 @@ def detach_to_cpu(data: dict) -> dict:
     }
 
 
+def maybe_rescale_keypoints(feats: dict, target_size) -> dict:
+    """Rescale keypoints to match the displayed image dimensions if needed."""
+    keypoints = feats.get('keypoints')
+    image_size = feats.get('image_size')
+    if keypoints is None or image_size is None or not isinstance(keypoints, torch.Tensor):
+        return feats
+
+    if isinstance(image_size, torch.Tensor):
+        size = image_size.view(-1).float().cpu()
+    else:
+        size = torch.tensor(image_size, dtype=torch.float32)
+    if size.numel() < 2:
+        return feats
+
+    src_w, src_h = float(size[0]), float(size[1])
+    dst_w, dst_h = map(float, target_size)
+    if abs(src_w - dst_w) < 1e-3 and abs(src_h - dst_h) < 1e-3:
+        return feats
+
+    scale = torch.tensor([dst_w / src_w, dst_h / src_h], dtype=keypoints.dtype, device=keypoints.device)
+    feats['keypoints'] = keypoints * scale
+    feats['image_size'] = torch.tensor([dst_w, dst_h], dtype=scale.dtype)
+    return feats
+
+
 def load_sift_bin(path, image_size):
     with open(path, 'rb') as f:
         (N,) = struct.unpack('<I', f.read(4))
@@ -266,6 +291,9 @@ for entry in os.scandir(matching_folder):
         if sift_matches.ndim == 1:
             sift_matches = sift_matches.unsqueeze(0)
 
+        target_size_left = (image0.shape[-1], image0.shape[-2])
+        target_size_right = (image1.shape[-1], image1.shape[-2])
+
         # compute matches from binary data (CudaSIFT)
         def image_to_bin_path(img_path):
             base, ext = os.path.splitext(img_path)
@@ -297,6 +325,7 @@ for entry in os.scandir(matching_folder):
         if bin_matches.ndim == 1:
             bin_matches = bin_matches.unsqueeze(0)
 
+
         sp_results = None
         if superpoint_extractor is not None:
             if use_lightglue and matcher_superpoint is not None:
@@ -324,6 +353,8 @@ for entry in os.scandir(matching_folder):
 
             if sp_matches.ndim == 1:
                 sp_matches = sp_matches.unsqueeze(0)
+            maybe_rescale_keypoints(feats0_sp, target_size_left)
+            maybe_rescale_keypoints(feats1_sp, target_size_right)
             sp_results = (feats0_sp, feats1_sp, sp_matches)
 
         num_rows = 3 if sp_results is not None else 2
