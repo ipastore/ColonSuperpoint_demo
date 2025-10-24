@@ -18,6 +18,7 @@ from utils.LightGlue.lightglue.superpoint import (
 from utils.LightGlue.lightglue.utils import Extractor, load_image, match_pair, rbd
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+MATCHER = 'lg'  # Options: 'lg' (LightGlue) or 'nn' (two-way nearest neighbor)
 SUPERPOINT_MODEL_NAME = "MagicLeap"  # e.g. "MagicLeap", "SuperpointNet", "SuperpointNet_gauss2"
 SUPERPOINT_WEIGHTS_PATH = "./weights/MagicLeap/superpoint_v1.pth"  
 
@@ -25,6 +26,41 @@ SUPERPOINT_WEIGHTS_PATH = "./weights/MagicLeap/superpoint_v1.pth"
 SUPERPOINT_MAX_KEYPOINTS = 2048
 SUPERPOINT_DETECTION_THRESHOLD = 0.015
 SUPERPOINT_MATCH_COLOR = 'lime'
+NN_MATCH_THRESHOLD = 0.7
+
+
+def nn_match_two_way(desc1: np.ndarray, desc2: np.ndarray, nn_thresh: float) -> np.ndarray:
+    """Two-way nearest-neighbor matching for L2-normalized descriptors."""
+    assert desc1.shape[0] == desc2.shape[0], 'Descriptor dimensions must match.'
+    if desc1.shape[1] == 0 or desc2.shape[1] == 0:
+        return np.zeros((3, 0))
+    if nn_thresh < 0.0:
+        raise ValueError('nn_thresh should be non-negative.')
+    dmat = np.dot(desc1.T, desc2)
+    dmat = np.sqrt(2 - 2 * np.clip(dmat, -1, 1))
+    idx = np.argmin(dmat, axis=1)
+    scores = dmat[np.arange(dmat.shape[0]), idx]
+    keep = scores < nn_thresh
+    idx2 = np.argmin(dmat, axis=0)
+    keep_bi = np.arange(len(idx)) == idx2[idx]
+    keep = np.logical_and(keep, keep_bi)
+    idx = idx[keep]
+    scores = scores[keep]
+    m_idx1 = np.arange(desc1.shape[1])[keep]
+    m_idx2 = idx
+    matches = np.zeros((3, int(keep.sum())))
+    matches[0, :] = m_idx1
+    matches[1, :] = m_idx2
+    matches[2, :] = scores
+    return matches
+
+
+def detach_to_cpu(data: dict) -> dict:
+    """Detach tensor values to CPU for downstream numpy/plotting usage."""
+    return {
+        key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
+        for key, value in data.items()
+    }
 
 
 def load_sift_bin(path, image_size):
@@ -97,7 +133,8 @@ class SuperPointFromWeights(Extractor):
         if image.device != self.device:
             image = image.to(self.device)
         if image.shape[1] == 3:
-            raise ValueError('SuperPointFromWeights expects grayscale images with 1 channel.')
+            r, g, b = image[:, 0:1], image[:, 1:2], image[:, 2:3]
+            image = 0.2989 * r + 0.5870 * g + 0.1140 * b
 
         logits, dense_descriptors = self.net(image)
         scores = torch.softmax(logits, dim=1)[:, :-1]
@@ -146,11 +183,15 @@ extractor_sift = SIFT(
     backend='opencv',
     detection_threshold=0.0000667,
 ).eval().to(DEVICE)
-matcher_sift = LightGlue(
-    features='sift',
-    depth_confidence=-1,
-    width_confidence=-1,
-).eval().to(DEVICE)
+
+use_lightglue = MATCHER.lower() == 'lg'
+matcher_sift = None
+if use_lightglue:
+    matcher_sift = LightGlue(
+        features='sift',
+        depth_confidence=-1,
+        width_confidence=-1,
+    ).eval().to(DEVICE)
 
 superpoint_extractor = None
 matcher_superpoint = None
@@ -162,11 +203,12 @@ if SUPERPOINT_MODEL_NAME and SUPERPOINT_WEIGHTS_PATH:
         max_num_keypoints=SUPERPOINT_MAX_KEYPOINTS,
         detection_threshold=SUPERPOINT_DETECTION_THRESHOLD,
     ).eval()
-    matcher_superpoint = LightGlue(
-        features='superpoint',
-        depth_confidence=-1,
-        width_confidence=-1,
-    ).eval().to(DEVICE)
+    if use_lightglue:
+        matcher_superpoint = LightGlue(
+            features='superpoint',
+            depth_confidence=-1,
+            width_confidence=-1,
+        ).eval().to(DEVICE)
 
 matching_folder = './assets/matching/examples'
 output_folder = './matching_outputs'
@@ -199,43 +241,89 @@ for entry in os.scandir(matching_folder):
 
         print(f"Matching {img_path0} and {img_path1}")
 
+        matcher_label = 'LG' if use_lightglue else 'NN'
+
         # compute matches A->B direction (SIFT)
-        feats0, feats1, matches01 = match_pair(extractor_sift, matcher_sift, image0, image1)
-        m_ab = matches01['matches']
-        p0_ab = feats0['keypoints'][m_ab[..., 0]]
-        p1_ab = feats1['keypoints'][m_ab[..., 1]]
+        if use_lightglue and matcher_sift is not None:
+            feats0_sift, feats1_sift, matches01 = match_pair(extractor_sift, matcher_sift, image0, image1)
+            sift_feats0 = detach_to_cpu(feats0_sift)
+            sift_feats1 = detach_to_cpu(feats1_sift)
+            sift_matches = matches01['matches'].cpu().long()
+        else:
+            feats0_raw = extractor_sift.extract(image0)
+            feats1_raw = extractor_sift.extract(image1)
+            sift_feats0 = detach_to_cpu(rbd(feats0_raw))
+            sift_feats1 = detach_to_cpu(rbd(feats1_raw))
+            desc0 = sift_feats0['descriptors'].T.numpy()
+            desc1 = sift_feats1['descriptors'].T.numpy()
+            matches_np = nn_match_two_way(desc0, desc1, NN_MATCH_THRESHOLD)
+            if matches_np.shape[1]:
+                sift_matches = torch.from_numpy(matches_np[:2].T.astype(np.int64))
+            else:
+                sift_matches = torch.empty((0, 2), dtype=torch.long)
+
+        if sift_matches.ndim == 1:
+            sift_matches = sift_matches.unsqueeze(0)
 
         # compute matches from binary data (CudaSIFT)
         def image_to_bin_path(img_path):
             base, ext = os.path.splitext(img_path)
             return f"{base}_sift.bin"
 
-        image_size = feats0['image_size']
+        image_size = sift_feats0['image_size']
         img0_bin = image_to_bin_path(img_path0)
         img1_bin = image_to_bin_path(img_path1)
         feats0_bin = load_sift_bin(img0_bin, image_size)
         feats1_bin = load_sift_bin(img1_bin, image_size)
 
-        matches01_bin = matcher_sift({"image0": feats0_bin, "image1": feats1_bin})
-        feats0_bin, feats1_bin, matches01_bin = [rbd(x) for x in [feats0_bin, feats1_bin, matches01_bin]]  # remove batch dimension
-        matches01_bin = matches01_bin['matches']  # indices with shape (K,2)
-        points0_bin = feats0_bin['keypoints'][matches01_bin[..., 0]]  # coordinates in image #0, shape (K,2)
-        points1_bin = feats1_bin['keypoints'][matches01_bin[..., 1]]  # coordinates in image #1, shape (K,2)
+        if use_lightglue and matcher_sift is not None:
+            matches01_bin = matcher_sift({"image0": feats0_bin, "image1": feats1_bin})
+            feats0_bin, feats1_bin, matches01_bin = [rbd(x) for x in [feats0_bin, feats1_bin, matches01_bin]]
+            feats0_bin = detach_to_cpu(feats0_bin)
+            feats1_bin = detach_to_cpu(feats1_bin)
+            bin_matches = matches01_bin['matches'].cpu().long()
+        else:
+            feats0_bin = detach_to_cpu(rbd(feats0_bin))
+            feats1_bin = detach_to_cpu(rbd(feats1_bin))
+            desc0_bin = feats0_bin['descriptors'].T.numpy()
+            desc1_bin = feats1_bin['descriptors'].T.numpy()
+            matches_np_bin = nn_match_two_way(desc0_bin, desc1_bin, NN_MATCH_THRESHOLD)
+            if matches_np_bin.shape[1]:
+                bin_matches = torch.from_numpy(matches_np_bin[:2].T.astype(np.int64))
+            else:
+                bin_matches = torch.empty((0, 2), dtype=torch.long)
+
+        if bin_matches.ndim == 1:
+            bin_matches = bin_matches.unsqueeze(0)
 
         sp_results = None
-        if superpoint_extractor is not None and matcher_superpoint is not None:
-            feats0_sp, feats1_sp, matches01_sp = match_pair(
-                superpoint_extractor,
-                matcher_superpoint,
-                image0,
-                image1,
-            )
-            matches_sp = matches01_sp['matches']
-            if matches_sp.numel() == 0:
-                matches_sp = matches_sp.new_zeros((0, 2), dtype=torch.long)
-            elif matches_sp.ndim == 1:
-                matches_sp = matches_sp.unsqueeze(0)
-            sp_results = (feats0_sp, feats1_sp, matches_sp)
+        if superpoint_extractor is not None:
+            if use_lightglue and matcher_superpoint is not None:
+                feats0_sp, feats1_sp, matches01_sp = match_pair(
+                    superpoint_extractor,
+                    matcher_superpoint,
+                    image0,
+                    image1,
+                )
+                feats0_sp = detach_to_cpu(feats0_sp)
+                feats1_sp = detach_to_cpu(feats1_sp)
+                sp_matches = matches01_sp['matches'].cpu().long()
+            else:
+                feats0_raw_sp = superpoint_extractor.extract(image0)
+                feats1_raw_sp = superpoint_extractor.extract(image1)
+                feats0_sp = detach_to_cpu(rbd(feats0_raw_sp))
+                feats1_sp = detach_to_cpu(rbd(feats1_raw_sp))
+                desc0_sp = feats0_sp['descriptors'].T.numpy()
+                desc1_sp = feats1_sp['descriptors'].T.numpy()
+                matches_np_sp = nn_match_two_way(desc0_sp, desc1_sp, NN_MATCH_THRESHOLD)
+                if matches_np_sp.shape[1]:
+                    sp_matches = torch.from_numpy(matches_np_sp[:2].T.astype(np.int64))
+                else:
+                    sp_matches = torch.empty((0, 2), dtype=torch.long)
+
+            if sp_matches.ndim == 1:
+                sp_matches = sp_matches.unsqueeze(0)
+            sp_results = (feats0_sp, feats1_sp, sp_matches)
 
         num_rows = 3 if sp_results is not None else 2
         fig, axes = plt.subplots(num_rows, 2, figsize=(12, 4 * num_rows))
@@ -255,52 +343,67 @@ for entry in os.scandir(matching_folder):
 
         # Row 0: SIFT+LG
         ax_left, ax_right = prep_axes(0)
-        n0 = feats0['keypoints'].shape[0]
-        n1 = feats1['keypoints'].shape[0]
-        matched0 = torch.zeros(n0, dtype=torch.bool, device=feats0['keypoints'].device)
-        matched1 = torch.zeros(n1, dtype=torch.bool, device=feats1['keypoints'].device)
-        matched0[m_ab[..., 0]] = True
-        matched1[m_ab[..., 1]] = True
-        nm_kpts0 = feats0['keypoints'][~matched0]
-        nm_kpts1 = feats1['keypoints'][~matched1]
+        n0 = sift_feats0['keypoints'].shape[0]
+        n1 = sift_feats1['keypoints'].shape[0]
+        matched0 = torch.zeros(n0, dtype=torch.bool)
+        matched1 = torch.zeros(n1, dtype=torch.bool)
+        if sift_matches.numel() > 0:
+            matched0[sift_matches[..., 0]] = True
+            matched1[sift_matches[..., 1]] = True
+            p0_ab = sift_feats0['keypoints'][sift_matches[..., 0]]
+            p1_ab = sift_feats1['keypoints'][sift_matches[..., 1]]
+        else:
+            p0_ab = torch.empty((0, 2))
+            p1_ab = torch.empty((0, 2))
+        nm_kpts0 = sift_feats0['keypoints'][~matched0]
+        nm_kpts1 = sift_feats1['keypoints'][~matched1]
         viz2d.plot_keypoints([nm_kpts0, nm_kpts1], colors="yellow", ps=2, axes=(ax_left, ax_right))
-        viz2d.plot_matches(p0_ab, p1_ab, color="lime", lw=0.2, axes=(ax_left, ax_right))
-        viz2d.add_text(0, f"SIFT+LG: {len(p0_ab)} matches", fs=16)
+        if p0_ab.numel() > 0:
+            viz2d.plot_matches(p0_ab, p1_ab, color="lime", lw=0.2, axes=(ax_left, ax_right))
+        viz2d.add_text(0, f"SIFT+{matcher_label}: {p0_ab.shape[0]} matches", fs=16)
 
         # Row 1: CudaSIFT+LG
         ax_left_cuda, ax_right_cuda = prep_axes(1)
         n0b = feats0_bin['keypoints'].shape[0]
         n1b = feats1_bin['keypoints'].shape[0]
-        matched0b = torch.zeros(n0b, dtype=torch.bool, device=feats0_bin['keypoints'].device)
-        matched1b = torch.zeros(n1b, dtype=torch.bool, device=feats1_bin['keypoints'].device)
-        matched0b[matches01_bin[..., 0]] = True
-        matched1b[matches01_bin[..., 1]] = True
+        matched0b = torch.zeros(n0b, dtype=torch.bool)
+        matched1b = torch.zeros(n1b, dtype=torch.bool)
+        if bin_matches.numel() > 0:
+            matched0b[bin_matches[..., 0]] = True
+            matched1b[bin_matches[..., 1]] = True
+            points0_bin = feats0_bin['keypoints'][bin_matches[..., 0]]
+            points1_bin = feats1_bin['keypoints'][bin_matches[..., 1]]
+        else:
+            points0_bin = torch.empty((0, 2))
+            points1_bin = torch.empty((0, 2))
         nm_kpts0b = feats0_bin['keypoints'][~matched0b]
         nm_kpts1b = feats1_bin['keypoints'][~matched1b]
         viz2d.plot_keypoints([nm_kpts0b, nm_kpts1b], colors="yellow", ps=2, axes=(ax_left_cuda, ax_right_cuda))
-        viz2d.plot_matches(points0_bin, points1_bin, color="lime", lw=0.2, axes=(ax_left_cuda, ax_right_cuda))
-        viz2d.add_text(2, f"CudaSIFT+LG: {len(points0_bin)} matches", fs=16)
+        if points0_bin.numel() > 0:
+            viz2d.plot_matches(points0_bin, points1_bin, color="lime", lw=0.2, axes=(ax_left_cuda, ax_right_cuda))
+        viz2d.add_text(2, f"CudaSIFT+{matcher_label}: {points0_bin.shape[0]} matches", fs=16)
 
         if sp_results is not None:
             feats0_sp, feats1_sp, matches_sp = sp_results
             ax_left_sp, ax_right_sp = prep_axes(2)
             n0_sp = feats0_sp['keypoints'].shape[0]
             n1_sp = feats1_sp['keypoints'].shape[0]
-            matched0_sp = torch.zeros(n0_sp, dtype=torch.bool, device=feats0_sp['keypoints'].device)
-            matched1_sp = torch.zeros(n1_sp, dtype=torch.bool, device=feats1_sp['keypoints'].device)
+            matched0_sp = torch.zeros(n0_sp, dtype=torch.bool)
+            matched1_sp = torch.zeros(n1_sp, dtype=torch.bool)
             if matches_sp.numel() > 0:
                 matched0_sp[matches_sp[..., 0]] = True
                 matched1_sp[matches_sp[..., 1]] = True
                 p0_sp = feats0_sp['keypoints'][matches_sp[..., 0]]
                 p1_sp = feats1_sp['keypoints'][matches_sp[..., 1]]
                 sp_match_count = p0_sp.shape[0]
-                viz2d.plot_matches(
-                    p0_sp,
-                    p1_sp,
-                    color=SUPERPOINT_MATCH_COLOR,
-                    lw=0.2,
-                    axes=(ax_left_sp, ax_right_sp),
-                )
+                if p0_sp.numel() > 0:
+                    viz2d.plot_matches(
+                        p0_sp,
+                        p1_sp,
+                        color=SUPERPOINT_MATCH_COLOR,
+                        lw=0.2,
+                        axes=(ax_left_sp, ax_right_sp),
+                    )
             else:
                 sp_match_count = 0
             nm_kpts0_sp = feats0_sp['keypoints'][~matched0_sp]
@@ -313,7 +416,7 @@ for entry in os.scandir(matching_folder):
             )
             viz2d.add_text(
                 4,
-                f"{SUPERPOINT_MODEL_NAME}+LG: {sp_match_count} matches",
+                f"{SUPERPOINT_MODEL_NAME}+{matcher_label}: {sp_match_count} matches",
                 fs=16,
                 color=SUPERPOINT_MATCH_COLOR,
             )
