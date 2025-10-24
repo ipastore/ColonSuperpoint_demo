@@ -199,13 +199,13 @@ for entry in os.scandir(matching_folder):
 
         print(f"Matching {img_path0} and {img_path1}")
 
-        # compute matches A->B direction
+        # compute matches A->B direction (SIFT)
         feats0, feats1, matches01 = match_pair(extractor_sift, matcher_sift, image0, image1)
         m_ab = matches01['matches']
         p0_ab = feats0['keypoints'][m_ab[..., 0]]
         p1_ab = feats1['keypoints'][m_ab[..., 1]]
 
-        # compute matches from binary data
+        # compute matches from binary data (CudaSIFT)
         def image_to_bin_path(img_path):
             base, ext = os.path.splitext(img_path)
             return f"{base}_sift.bin"
@@ -222,38 +222,7 @@ for entry in os.scandir(matching_folder):
         points0_bin = feats0_bin['keypoints'][matches01_bin[..., 0]]  # coordinates in image #0, shape (K,2)
         points1_bin = feats1_bin['keypoints'][matches01_bin[..., 1]]  # coordinates in image #1, shape (K,2)
 
-        # Create figure with 2 rows (A->B and B->A) and 2 columns (left and right images)
-        fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-        
-        # Row 0: A->B direction
-        ax_left_ab = axes[0, 0]
-        ax_right_ab = axes[0, 1]
-        
-        ax_left_ab.imshow(image0.permute(1, 2, 0).cpu().numpy())
-        ax_right_ab.imshow(image1.permute(1, 2, 0).cpu().numpy())
-        
-        for ax_ in (ax_left_ab, ax_right_ab):
-            ax_.get_yaxis().set_ticks([])
-            ax_.get_xaxis().set_ticks([])
-            ax_.set_axis_off()
-            for spine in ax_.spines.values():
-                spine.set_visible(False)
-        
-        # plot non-matched keypoints (extractor) in yellow
-        n0 = feats0['keypoints'].shape[0]
-        n1 = feats1['keypoints'].shape[0]
-        matched0 = torch.zeros(n0, dtype=torch.bool, device=feats0['keypoints'].device)
-        matched1 = torch.zeros(n1, dtype=torch.bool, device=feats1['keypoints'].device)
-        matched0[m_ab[..., 0]] = True
-        matched1[m_ab[..., 1]] = True
-        nm_kpts0 = feats0['keypoints'][~matched0]
-        nm_kpts1 = feats1['keypoints'][~matched1]
-        viz2d.plot_keypoints([nm_kpts0, nm_kpts1], colors="yellow", ps=2, axes=(ax_left_ab, ax_right_ab))
-
-        # plot matched keypoints and lines (extractor) in lime
-        viz2d.plot_matches(p0_ab, p1_ab, color="lime", lw=0.2, axes=(ax_left_ab, ax_right_ab))
-        viz2d.add_text(0, f"SIFT+LG: {len(p0_ab)} matches", fs=16)
-
+        sp_results = None
         if superpoint_extractor is not None and matcher_superpoint is not None:
             feats0_sp, feats1_sp, matches01_sp = match_pair(
                 superpoint_extractor,
@@ -262,44 +231,44 @@ for entry in os.scandir(matching_folder):
                 image1,
             )
             matches_sp = matches01_sp['matches']
-            if matches_sp.ndim == 1:
-                matches_sp = matches_sp.reshape(-1, 2)
-            if matches_sp.numel() > 0:
-                p0_sp = feats0_sp['keypoints'][matches_sp[..., 0]]
-                p1_sp = feats1_sp['keypoints'][matches_sp[..., 1]]
-                viz2d.plot_matches(
-                    p0_sp,
-                    p1_sp,
-                    color=SUPERPOINT_MATCH_COLOR,
-                    lw=0.2,
-                    axes=(ax_left_ab, ax_right_ab),
-                )
-                sp_match_count = p0_sp.shape[0]
-            else:
-                sp_match_count = 0
-            viz2d.add_text(
-                0,
-                f"{SUPERPOINT_MODEL_NAME}+LG: {sp_match_count} matches",
-                pos=(0.01, 0.87),
-                fs=16,
-                color=SUPERPOINT_MATCH_COLOR,
-            )
+            if matches_sp.numel() == 0:
+                matches_sp = matches_sp.new_zeros((0, 2), dtype=torch.long)
+            elif matches_sp.ndim == 1:
+                matches_sp = matches_sp.unsqueeze(0)
+            sp_results = (feats0_sp, feats1_sp, matches_sp)
 
-        # Row 1: B->A direction
-        ax_left_ab = axes[1, 0]
-        ax_right_ab = axes[1, 1]
-        
-        ax_left_ab.imshow(image0.permute(1, 2, 0).cpu().numpy())
-        ax_right_ab.imshow(image1.permute(1, 2, 0).cpu().numpy())
-        
-        for ax_ in (ax_left_ab, ax_right_ab):
-            ax_.get_yaxis().set_ticks([])
-            ax_.get_xaxis().set_ticks([])
-            ax_.set_axis_off()
-            for spine in ax_.spines.values():
-                spine.set_visible(False)
-        
-        # plot non-matched keypoints (binary) in yellow
+        num_rows = 3 if sp_results is not None else 2
+        fig, axes = plt.subplots(num_rows, 2, figsize=(12, 4 * num_rows))
+        axes = np.atleast_2d(axes)
+
+        def prep_axes(row_idx):
+            left, right = axes[row_idx, 0], axes[row_idx, 1]
+            left.imshow(image0.permute(1, 2, 0).cpu().numpy())
+            right.imshow(image1.permute(1, 2, 0).cpu().numpy())
+            for ax_ in (left, right):
+                ax_.get_yaxis().set_ticks([])
+                ax_.get_xaxis().set_ticks([])
+                ax_.set_axis_off()
+                for spine in ax_.spines.values():
+                    spine.set_visible(False)
+            return left, right
+
+        # Row 0: SIFT+LG
+        ax_left, ax_right = prep_axes(0)
+        n0 = feats0['keypoints'].shape[0]
+        n1 = feats1['keypoints'].shape[0]
+        matched0 = torch.zeros(n0, dtype=torch.bool, device=feats0['keypoints'].device)
+        matched1 = torch.zeros(n1, dtype=torch.bool, device=feats1['keypoints'].device)
+        matched0[m_ab[..., 0]] = True
+        matched1[m_ab[..., 1]] = True
+        nm_kpts0 = feats0['keypoints'][~matched0]
+        nm_kpts1 = feats1['keypoints'][~matched1]
+        viz2d.plot_keypoints([nm_kpts0, nm_kpts1], colors="yellow", ps=2, axes=(ax_left, ax_right))
+        viz2d.plot_matches(p0_ab, p1_ab, color="lime", lw=0.2, axes=(ax_left, ax_right))
+        viz2d.add_text(0, f"SIFT+LG: {len(p0_ab)} matches", fs=16)
+
+        # Row 1: CudaSIFT+LG
+        ax_left_cuda, ax_right_cuda = prep_axes(1)
         n0b = feats0_bin['keypoints'].shape[0]
         n1b = feats1_bin['keypoints'].shape[0]
         matched0b = torch.zeros(n0b, dtype=torch.bool, device=feats0_bin['keypoints'].device)
@@ -308,11 +277,46 @@ for entry in os.scandir(matching_folder):
         matched1b[matches01_bin[..., 1]] = True
         nm_kpts0b = feats0_bin['keypoints'][~matched0b]
         nm_kpts1b = feats1_bin['keypoints'][~matched1b]
-        viz2d.plot_keypoints([nm_kpts0b, nm_kpts1b], colors="yellow", ps=2, axes=(ax_left_ab, ax_right_ab))
-
-        # plot matched keypoints and lines (binary) in lime
-        viz2d.plot_matches(points0_bin, points1_bin, color="lime", lw=0.2, axes=(ax_left_ab, ax_right_ab))
+        viz2d.plot_keypoints([nm_kpts0b, nm_kpts1b], colors="yellow", ps=2, axes=(ax_left_cuda, ax_right_cuda))
+        viz2d.plot_matches(points0_bin, points1_bin, color="lime", lw=0.2, axes=(ax_left_cuda, ax_right_cuda))
         viz2d.add_text(2, f"CudaSIFT+LG: {len(points0_bin)} matches", fs=16)
+
+        if sp_results is not None:
+            feats0_sp, feats1_sp, matches_sp = sp_results
+            ax_left_sp, ax_right_sp = prep_axes(2)
+            n0_sp = feats0_sp['keypoints'].shape[0]
+            n1_sp = feats1_sp['keypoints'].shape[0]
+            matched0_sp = torch.zeros(n0_sp, dtype=torch.bool, device=feats0_sp['keypoints'].device)
+            matched1_sp = torch.zeros(n1_sp, dtype=torch.bool, device=feats1_sp['keypoints'].device)
+            if matches_sp.numel() > 0:
+                matched0_sp[matches_sp[..., 0]] = True
+                matched1_sp[matches_sp[..., 1]] = True
+                p0_sp = feats0_sp['keypoints'][matches_sp[..., 0]]
+                p1_sp = feats1_sp['keypoints'][matches_sp[..., 1]]
+                sp_match_count = p0_sp.shape[0]
+                viz2d.plot_matches(
+                    p0_sp,
+                    p1_sp,
+                    color=SUPERPOINT_MATCH_COLOR,
+                    lw=0.2,
+                    axes=(ax_left_sp, ax_right_sp),
+                )
+            else:
+                sp_match_count = 0
+            nm_kpts0_sp = feats0_sp['keypoints'][~matched0_sp]
+            nm_kpts1_sp = feats1_sp['keypoints'][~matched1_sp]
+            viz2d.plot_keypoints(
+                [nm_kpts0_sp, nm_kpts1_sp],
+                colors="yellow",
+                ps=2,
+                axes=(ax_left_sp, ax_right_sp),
+            )
+            viz2d.add_text(
+                4,
+                f"{SUPERPOINT_MODEL_NAME}+LG: {sp_match_count} matches",
+                fs=16,
+                color=SUPERPOINT_MATCH_COLOR,
+            )
 
         fig.tight_layout(pad=0.5)
 
