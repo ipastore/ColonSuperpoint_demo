@@ -95,6 +95,7 @@ def run_nn_matching(feats0: dict, feats1: dict, threshold: float) -> torch.Tenso
     if desc0.size == 0 or desc1.size == 0:
         return torch.empty((0, 2), dtype=torch.long)
     matches = nn_match_two_way(desc0, desc1, threshold)
+    print(f"[DEBUG] NN run: desc0={desc0.shape} desc1={desc1.shape} matches={matches.shape[1]}")
     if matches.shape[1] == 0:
         return torch.empty((0, 2), dtype=torch.long)
     return torch.from_numpy(matches[:2].T.astype(np.int64))
@@ -145,6 +146,7 @@ def plot_matches_on_axes(
     if isinstance(keypoints1, torch.Tensor):
         keypoints1 = keypoints1.cpu()
 
+    print(f"[DEBUG] {title_prefix} matches shape={matches.shape} max_idx0={matches[:,0].max().item() if matches.numel() else 'N/A'} max_idx1={matches[:,1].max().item() if matches.numel() else 'N/A'}")
     matches = matches.cpu()
     if matches.ndim == 1:
         matches = matches.unsqueeze(0)
@@ -355,6 +357,7 @@ for entry in os.scandir(matching_folder):
     os.makedirs(out_subfolder, exist_ok=True)
 
     for img_path0, img_path1 in combinations(images, 2):
+        print(f"[DEBUG] image0 shape={tuple(image0.shape)} image1 shape={tuple(image1.shape)}")
         image0 = load_image(img_path0).to(DEVICE)
         image1 = load_image(img_path1).to(DEVICE)
 
@@ -403,6 +406,11 @@ for entry in os.scandir(matching_folder):
         if superpoint_row is not None:
             feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg = superpoint_row
             rows.append((SUPERPOINT_MODEL_NAME or "SuperPoint", feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg, SUPERPOINT_MATCH_COLOR))
+
+        rows_nn_counts = [matches_nn_row.shape[0] for _, _, _, matches_nn_row, _, _ in rows]
+        rows_lg_counts = [matches_lg_row.shape[0] for _, _, _, _, matches_lg_row, _ in rows]
+        print(f'[DEBUG] NN counts per row: {rows_nn_counts}')
+        print(f'[DEBUG] LG counts per row: {rows_lg_counts}')
 
         fig, axes = plt.subplots(len(rows), 4, figsize=(16, 4 * len(rows)))
         axes = np.atleast_2d(axes)
