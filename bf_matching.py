@@ -16,6 +16,7 @@ from utils.LightGlue.lightglue.superpoint import (
     top_k_keypoints,
 )
 from utils.LightGlue.lightglue.utils import Extractor, load_image, match_pair, rbd
+from kornia.color import rgb_to_grayscale
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 MATCHER = 'lg'  # Options: 'lg' (LightGlue) or 'nn' (two-way nearest neighbor)
@@ -111,7 +112,7 @@ class SuperPointFromWeights(Extractor):
         'detection_threshold': 0.0005,
         'remove_borders': 4,
     }
-    preprocess_conf = {'resize': 1024}
+    preprocess_conf = {'resize': None}
     required_data_keys = ['image']
 
     def __init__(
@@ -133,8 +134,8 @@ class SuperPointFromWeights(Extractor):
         if image.device != self.device:
             image = image.to(self.device)
         if image.shape[1] == 3:
-            r, g, b = image[:, 0:1], image[:, 1:2], image[:, 2:3]
-            image = 0.2989 * r + 0.5870 * g + 0.1140 * b
+            image = rgb_to_grayscale(image)
+
 
         logits, dense_descriptors = self.net(image)
         scores = torch.softmax(logits, dim=1)[:, :-1]
@@ -417,8 +418,7 @@ for entry in os.scandir(matching_folder):
             viz2d.add_text(
                 4,
                 f"{SUPERPOINT_MODEL_NAME}+{matcher_label}: {sp_match_count} matches",
-                fs=16,
-                color=SUPERPOINT_MATCH_COLOR,
+                fs=16
             )
 
         fig.tight_layout(pad=0.5)
