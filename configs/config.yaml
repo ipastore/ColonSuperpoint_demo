@@ -21,12 +21,12 @@ camid: 0                           # Camera index if using live capture
 # weights_path: weights/MagicLeap/non_mask_when_training/04_ds4_th015_nms_4_bs8_lr000104_ds4_non_mask_th015_nhom10_nms_4_Magicleap_bs8_lr0001_th015_nms4_48865_checkpoint.pth
 # weights_path: weights/MagicLeap/non_mask_when_training/05_ds4_th000075_nhom10_nms4_bs16_lr00001_th015_nms4_MagicLeap_200000_checkpoint.pth
 
-model: SuperpointNet               # MagicLeap plus batchnorm
+# model: SuperpointNet               # MagicLeap plus batchnorm
 # weights_path: weights/SuperpointNet/superPointNet_200000_checkpoint.pth #BASELINE sp-pytorch
 
-weights_path: weights/SuperpointNet/leon_esuperPointNet_400000_checkpoint.pth   # Leon s track adaptation
+# weights_path: weights/SuperpointNet/leon_esuperPointNet_400000_checkpoint.pth   # Leon s track adaptation
 
-# model: SuperpointNet_gauss2      # SuperpoinTorch U-net variant
+model: SuperpointNet_gauss2      # SuperpoinTorch U-net variant
 
 # weights_path: weights/SuperpointNet_gauss2/superPointNet_gauss2_170000_checkpoint.pth #BASELINE sp-pytorch
 

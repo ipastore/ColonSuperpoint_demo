@@ -1,14 +1,22 @@
-import os
+"""CLI tool to compare SIFT/CudaSIFT and SuperPoint matches using LightGlue and NN."""
+
+from __future__ import annotations
+
+import argparse
+import itertools
 import struct
-from itertools import combinations
+import sys
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-from pathlib import Path
+import yaml
+from kornia.color import rgb_to_grayscale
 
-from models import build_superpoint_model
+from models import SUPERPOINT_MODEL_CHOICES, build_superpoint_model
 from utils.LightGlue.lightglue import LightGlue, SIFT
 from utils.LightGlue.lightglue import viz2d
 from utils.LightGlue.lightglue.superpoint import (
@@ -16,29 +24,35 @@ from utils.LightGlue.lightglue.superpoint import (
     simple_nms,
     top_k_keypoints,
 )
-from utils.LightGlue.lightglue.utils import Extractor, load_image, match_pair, rbd
-from kornia.color import rgb_to_grayscale
+from utils.LightGlue.lightglue.utils import (
+    Extractor,
+    load_image,
+    match_pair,
+    rbd,
+    read_image,
+    resize_image,
+    numpy_image_to_torch,
+)
 
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-SUPERPOINT_MODEL_NAME = "MagicLeap"  # e.g. "MagicLeap", "SuperpointNet", "SuperpointNet_gauss2"
-SUPERPOINT_WEIGHTS_PATH = "./weights/MagicLeap/superpoint_v1.pth"  
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# e.g. "./weights/magicleap_superpoint.pth"
-SUPERPOINT_MAX_KEYPOINTS = 2048
-SUPERPOINT_DETECTION_THRESHOLD = 0.015
-SUPERPOINT_MATCH_COLOR = 'lime'
-NN_MATCH_THRESHOLD = 0.7
-NN_MATCH_COLOR = 'dodgerblue'
-LG_MATCH_COLOR = 'lime'
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
 
-def nn_match_two_way(desc1: np.ndarray, desc2: np.ndarray, nn_thresh: float) -> np.ndarray:
-    """Two-way nearest-neighbor matching for L2-normalized descriptors."""
-    assert desc1.shape[0] == desc2.shape[0], 'Descriptor dimensions must match.'
+def nn_match_two_way(
+    desc1: np.ndarray,
+    desc2: np.ndarray,
+    nn_thresh: float,
+    ratio_thresh: Optional[float] = None,
+) -> np.ndarray:
+    """Two-way nearest-neighbour matching with optional Lowe ratio filtering."""
+
+    assert desc1.shape[0] == desc2.shape[0], "Descriptor dimensions must match."
     if desc1.shape[1] == 0 or desc2.shape[1] == 0:
         return np.zeros((3, 0))
     if nn_thresh < 0.0:
-        raise ValueError('nn_thresh should be non-negative.')
+        raise ValueError("nn_thresh should be non-negative")
+
     dmat = np.dot(desc1.T, desc2)
     dmat = np.sqrt(2 - 2 * np.clip(dmat, -1, 1))
     idx = np.argmin(dmat, axis=1)
@@ -47,11 +61,18 @@ def nn_match_two_way(desc1: np.ndarray, desc2: np.ndarray, nn_thresh: float) -> 
     idx2 = np.argmin(dmat, axis=0)
     keep_bi = np.arange(len(idx)) == idx2[idx]
     keep = np.logical_and(keep, keep_bi)
+
+    if ratio_thresh is not None and ratio_thresh < 1.0 and desc2.shape[1] > 1:
+        second_best = np.partition(dmat, 1, axis=1)[:, 1]
+        second_best = np.clip(second_best, 1e-12, None)
+        ratios = scores / second_best
+        keep = np.logical_and(keep, ratios <= ratio_thresh)
+
     idx = idx[keep]
     scores = scores[keep]
     m_idx1 = np.arange(desc1.shape[1])[keep]
     m_idx2 = idx
-    matches = np.zeros((3, int(keep.sum())))
+    matches = np.zeros((3, int(keep.sum())), dtype=np.float32)
     matches[0, :] = m_idx1
     matches[1, :] = m_idx2
     matches[2, :] = scores
@@ -77,7 +98,8 @@ def descriptors_to_matrix(feats: dict) -> np.ndarray:
         desc = np.asarray(desc)
     if desc.ndim != 2:
         return np.zeros((0, 0), dtype=np.float32)
-    keypoints = feats.get('keypoints')
+
+    keypoints = feats.get("keypoints")
     num_keypoints = None
     if isinstance(keypoints, torch.Tensor):
         num_keypoints = keypoints.shape[0]
@@ -88,14 +110,15 @@ def descriptors_to_matrix(feats: dict) -> np.ndarray:
     return desc.astype(np.float32, copy=False)
 
 
-def run_nn_matching(feats0: dict, feats1: dict, threshold: float) -> torch.Tensor:
-    """Compute two-way NN matches and return indices as a tensor of shape (K, 2)."""
+def run_nn_matching(
+    feats0: dict, feats1: dict, threshold: float, ratio_thresh: Optional[float]
+) -> torch.Tensor:
+    """Compute two-way NN matches with optional ratio_thresh and return indices as a tensor of shape (K, 2)."""
     desc0 = descriptors_to_matrix(feats0)
     desc1 = descriptors_to_matrix(feats1)
     if desc0.size == 0 or desc1.size == 0:
         return torch.empty((0, 2), dtype=torch.long)
-    matches = nn_match_two_way(desc0, desc1, threshold)
-    print(f"[DEBUG] NN run: desc0={desc0.shape} desc1={desc1.shape} matches={matches.shape[1]}")
+    matches = nn_match_two_way(desc0, desc1, threshold, ratio_thresh)
     if matches.shape[1] == 0:
         return torch.empty((0, 2), dtype=torch.long)
     return torch.from_numpy(matches[:2].T.astype(np.int64))
@@ -134,9 +157,8 @@ def plot_matches_on_axes(
     title_prefix: str,
     match_color: str,
 ) -> None:
-    """Overlay keypoints and matches on a pair of axes."""
-    keypoints0 = feats0.get('keypoints')
-    keypoints1 = feats1.get('keypoints')
+    keypoints0 = feats0.get("keypoints")
+    keypoints1 = feats1.get("keypoints")
     if keypoints0 is None or keypoints1 is None:
         ax_left.set_title(f"{title_prefix}: 0 matches", fontsize=10)
         ax_right.set_title("")
@@ -146,7 +168,6 @@ def plot_matches_on_axes(
     if isinstance(keypoints1, torch.Tensor):
         keypoints1 = keypoints1.cpu()
 
-    print(f"[DEBUG] {title_prefix} matches shape={matches.shape} max_idx0={matches[:,0].max().item() if matches.numel() else 'N/A'} max_idx1={matches[:,1].max().item() if matches.numel() else 'N/A'}")
     matches = matches.cpu()
     if matches.ndim == 1:
         matches = matches.unsqueeze(0)
@@ -173,18 +194,19 @@ def plot_matches_on_axes(
     viz2d.plot_keypoints([nm_kpts0], colors="yellow", ps=2, axes=[ax_left])
     viz2d.plot_keypoints([nm_kpts1], colors="yellow", ps=2, axes=[ax_right])
     if matched_kpts0.numel() > 0:
-        viz2d.plot_matches(matched_kpts0, matched_kpts1, color=match_color, lw=0.2, axes=(ax_left, ax_right))
+        viz2d.plot_matches(
+            matched_kpts0, matched_kpts1, color=match_color, lw=0.2, axes=(ax_left, ax_right)
+        )
 
     ax_left.set_title(f"{title_prefix}: {matched_kpts0.shape[0]} matches", fontsize=10)
     ax_right.set_title("")
 
 
 def load_sift_bin(path, image_size):
-    with open(path, 'rb') as f:
-        (N,) = struct.unpack('<I', f.read(4))
-        # Each record = 2 + 128 float32s
-        rec = 4 + 128  # x,y,scale,orientation + 128-d desc
-        data = np.fromfile(f, dtype=np.float32, count=N*rec).reshape(N, rec)
+    with open(path, "rb") as f:
+        (N,) = struct.unpack("<I", f.read(4))
+        rec = 4 + 128
+        data = np.fromfile(f, dtype=np.float32, count=N * rec).reshape(N, rec)
     keypoints = (
         torch.from_numpy(data[:, :2].copy()).to(dtype=torch.float32).unsqueeze(0).to(DEVICE)
     )  # (1, N, 2)
@@ -221,36 +243,27 @@ class SuperPointFromWeights(Extractor):
     """Minimal LightGlue-compatible extractor wrapping repository SuperPoint models."""
 
     default_conf = {
-        'descriptor_dim': 256,
-        'nms_radius': 4,
-        'max_num_keypoints': 2048,
-        'detection_threshold': 0.0005,
-        'remove_borders': 4,
+        "descriptor_dim": 256,
+        "nms_radius": 4,
+        "max_num_keypoints": 2048,
+        "detection_threshold": 0.0005,
+        "remove_borders": 4,
     }
-    preprocess_conf = {'resize': None}
-    required_data_keys = ['image']
+    preprocess_conf = {"resize": 1024}
+    required_data_keys = ["image"]
 
-    def __init__(
-        self,
-        model_name: str,
-        weights_path: str,
-        device: torch.device = None,
-        **conf,
-    ) -> None:
+    def __init__(self, model_name: str, weights_path: str, device: torch.device, **conf) -> None:
         super().__init__(**conf)
         self.model_name = model_name
-        self.device = torch.device(device or DEVICE)
+        self.device = torch.device(device)
         self.net = build_superpoint_model(model_name, weights_path, self.device)
         self.net.eval()
 
     @torch.no_grad()
     def forward(self, data: dict) -> dict:
-        image = data['image']
-        if image.device != self.device:
-            image = image.to(self.device)
+        image = data["image"].to(self.device)
         if image.shape[1] == 3:
             image = rgb_to_grayscale(image)
-
 
         logits, dense_descriptors = self.net(image)
         scores = torch.softmax(logits, dim=1)[:, :-1]
@@ -289,145 +302,385 @@ class SuperPointFromWeights(Extractor):
         ]
 
         return {
-            'keypoints': torch.stack(keypoints, 0),
-            'keypoint_scores': torch.stack(keypoint_scores, 0),
-            'descriptors': torch.stack(descriptors, 0).transpose(-1, -2).contiguous(),
+            "keypoints": torch.stack(keypoints, 0),
+            "keypoint_scores": torch.stack(keypoint_scores, 0),
+            "descriptors": torch.stack(descriptors, 0).transpose(-1, -2).contiguous(),
         }
 
-extractor_sift = SIFT(
-    max_num_keypoints=2048,
-    backend='opencv',
-    detection_threshold=0.0000667,
-).eval().to(DEVICE)
 
-matcher_sift_lg = LightGlue(
-    features='sift',
-    depth_confidence=-1,
-    width_confidence=-1,
-).eval().to(DEVICE)
+def parse_args() -> argparse.Namespace:
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument(
+        "--config",
+        type=str,
+        help="YAML file with default options (keys must match CLI flags).",
+    )
 
-superpoint_extractor = None
-matcher_superpoint_lg = None
-if SUPERPOINT_MODEL_NAME and SUPERPOINT_WEIGHTS_PATH:
-    superpoint_extractor = SuperPointFromWeights(
-        SUPERPOINT_MODEL_NAME,
-        SUPERPOINT_WEIGHTS_PATH,
-        device=DEVICE,
-        max_num_keypoints=SUPERPOINT_MAX_KEYPOINTS,
-        detection_threshold=SUPERPOINT_DETECTION_THRESHOLD,
-    ).eval()
-    matcher_superpoint_lg = LightGlue(
-        features='superpoint',
-        depth_confidence=-1,
-        width_confidence=-1,
+    default_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    parser = argparse.ArgumentParser(parents=[config_parser], description=__doc__)
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="./assets/matching/",
+        help="Path to the dataset root (default: ./assets/matching)",
+    )
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default=None,
+        help="Optional subfolder name inside --dataset to evaluate",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="./matching_outputs",
+        help="Destination directory for comparison figures",
+    )
+    parser.add_argument(
+        "--run-name",
+        type=str,
+        default="compare_matching",
+        help="Name of the run/output subfolder",
+    )
+    parser.add_argument(
+        "--downscale",
+        type=int,
+        choices=[1, 2, 4, 6],
+        default=1,
+        help="Image downscale factor (1 leaves original size)",
+    )
+    parser.add_argument(
+        "--lightglue-filter-threshold",
+        type=float,
+        default=0.1,
+        help="LightGlue filter threshold",
+    )
+    parser.add_argument(
+        "--lightglue-depth-confidence",
+        type=float,
+        default=-1,
+        help="LightGlue depth confidence",
+    )
+    parser.add_argument(
+        "--lightglue-width-confidence",
+        type=float,
+        default=-1,
+        help="LightGlue width confidence",
+    )
+    parser.add_argument(
+        "--sift-lowe-thresh",
+        type=float,
+        default=0.75,
+        help="Lowe ratio threshold for NN matcher",
+    )
+    parser.add_argument(
+        "--sift-max-keypoints",
+        type=int,
+        default=2048,
+        help="Max keypoints for the SIFT extractor",
+    )
+    parser.add_argument(
+        "--sift-contrast-threshold",
+        type=float,
+        default=0.00025,
+        help="SIFT contrast threshold",
+    )
+    parser.add_argument(
+        "--sift-edge-threshold",
+        type=float,
+        default=100.0,
+        help="SIFT edge threshold",
+    )
+    parser.add_argument(
+        "--sift-n-octave-layers",
+        type=int,
+        default=8,
+        help="Number of octave layers for SIFT",
+    )
+    parser.add_argument(
+        "--nn-match-threshold",
+        type=float,
+        default=0.7,
+        help="Descriptor distance threshold for NN matcher",
+    )
+    parser.add_argument(
+        "--superpoint-model-name",
+        type=str,
+        default="MagicLeap",
+        choices=SUPERPOINT_MODEL_CHOICES,
+        help="SuperPoint model variant",
+    )
+    parser.add_argument(
+        "--superpoint-weights-path",
+        type=str,
+        default="./weights/MagicLeap/superpoint_v1.pth",
+        help="Path to SuperPoint weights",
+    )
+    parser.add_argument(
+        "--superpoint-max-keypoints",
+        type=int,
+        default=2048,
+        help="Max SuperPoint keypoints",
+    )
+    parser.add_argument(
+        "--superpoint-detection-threshold",
+        type=float,
+        default=0.015,
+        help="SuperPoint detection threshold",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["cpu", "cuda"],
+        default=default_device,
+        help="Computation device",
+    )
+
+    config_args, remaining = config_parser.parse_known_args()
+    if config_args.config:
+        config_path = Path(config_args.config)
+        if not config_path.exists():
+            parser.error(f"Config file not found: {config_path}")
+        config_data = yaml.safe_load(config_path.read_text()) or {}
+        if not isinstance(config_data, dict):
+            parser.error("Config file must map option names to values.")
+        parser.set_defaults(**config_data)
+
+    opt = parser.parse_args(remaining)
+    opt.config = config_args.config
+    return opt
+
+
+def gather_image_sets(root: Path, dataset_name: Optional[str]) -> List[Tuple[Path, List[Path]]]:
+    if dataset_name:
+        target = root / dataset_name
+        if not target.exists():
+            raise FileNotFoundError(f"Dataset subfolder not found: {target}")
+        candidates = [target]
+    else:
+        subdirs = [p for p in root.iterdir() if p.is_dir()]
+        candidates = subdirs if subdirs else [root]
+
+    image_sets: List[Tuple[Path, List[Path]]] = []
+    for folder in candidates:
+        images = sorted(
+            [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
+        )
+        if len(images) >= 2:
+            image_sets.append((folder, images))
+    if not image_sets:
+        raise RuntimeError(f"No valid image folders found under {root}")
+    return image_sets
+
+
+def load_preprocessed_image(path: Path, downscale: int) -> torch.Tensor:
+    if downscale <= 1:
+        return load_image(str(path)).to(DEVICE)
+
+    image = read_image(str(path))
+    h, w = image.shape[:2]
+    target_h = max(1, int(round(h / downscale)))
+    target_w = max(1, int(round(w / downscale)))
+    resized, _ = resize_image(image, (target_h, target_w))
+    return numpy_image_to_torch(resized).to(DEVICE)
+
+
+def rescale_feature_dict(feats: dict, factor: int) -> dict:
+    if factor == 1:
+        return feats
+    scale = 1.0 / factor
+    if "keypoints" in feats and isinstance(feats["keypoints"], torch.Tensor):
+        feats["keypoints"] = feats["keypoints"] * scale
+    if "image_size" in feats and isinstance(feats["image_size"], torch.Tensor):
+        feats["image_size"] = feats["image_size"] * scale
+    return feats
+
+
+def process_pair(
+    image0_path: Path,
+    image1_path: Path,
+    downscale: int,
+    extractor_sift: SIFT,
+    matcher_sift_lg: LightGlue,
+    superpoint_extractor: Optional[SuperPointFromWeights],
+    matcher_superpoint_lg: Optional[LightGlue],
+    nn_threshold: float,
+    ratio_thresh: Optional[float],
+    superpoint_label: Optional[str],
+) -> Tuple[np.ndarray, np.ndarray, List[Tuple[str, dict, dict, torch.Tensor, torch.Tensor, str]]]:
+    image0 = load_preprocessed_image(image0_path, downscale)
+    image1 = load_preprocessed_image(image1_path, downscale)
+    image0_np = image0.permute(1, 2, 0).cpu().numpy()
+    image1_np = image1.permute(1, 2, 0).cpu().numpy()
+
+    feats0_sift, feats1_sift, matches_sift_lg_batch = match_pair(extractor_sift, matcher_sift_lg, image0, image1)
+    feats0_sift = detach_to_cpu(feats0_sift)
+    feats1_sift = detach_to_cpu(feats1_sift)
+    matches_sift_lg = lightglue_matches_to_tensor(matches_sift_lg_batch["matches"])
+    matches_sift_nn = run_nn_matching(feats0_sift, feats1_sift, nn_threshold, ratio_thresh)
+
+    def image_to_bin_path(path: Path) -> Path:
+        return path.with_name(path.stem + "_sift.bin")
+
+    image_size = feats0_sift["image_size"]
+    feats0_bin_raw = load_sift_bin(image_to_bin_path(image0_path), image_size)
+    feats1_bin_raw = load_sift_bin(image_to_bin_path(image1_path), image_size)
+    matches_bin_lg_batch = matcher_sift_lg({"image0": feats0_bin_raw, "image1": feats1_bin_raw})
+    feats0_bin = detach_to_cpu(rbd(feats0_bin_raw))
+    feats1_bin = detach_to_cpu(rbd(feats1_bin_raw))
+    feats0_bin = rescale_feature_dict(feats0_bin, downscale)
+    feats1_bin = rescale_feature_dict(feats1_bin, downscale)
+    matches_bin_lg = lightglue_matches_to_tensor(rbd(matches_bin_lg_batch)["matches"])
+    matches_bin_nn = run_nn_matching(feats0_bin, feats1_bin, nn_threshold, ratio_thresh)
+
+    superpoint_row = None
+    if superpoint_extractor is not None and matcher_superpoint_lg is not None:
+        feats0_sp, feats1_sp, matches_sp_lg_batch = match_pair(
+            superpoint_extractor,
+            matcher_superpoint_lg,
+            image0,
+            image1,
+        )
+        feats0_sp = detach_to_cpu(feats0_sp)
+        feats1_sp = detach_to_cpu(feats1_sp)
+        matches_sp_lg = lightglue_matches_to_tensor(matches_sp_lg_batch["matches"])
+        matches_sp_nn = run_nn_matching(feats0_sp, feats1_sp, nn_threshold, ratio_thresh)
+        superpoint_row = (feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg)
+
+    rows = [
+        ("SIFT", feats0_sift, feats1_sift, matches_sift_nn, matches_sift_lg, "lime"),
+        ("CudaSIFT", feats0_bin, feats1_bin, matches_bin_nn, matches_bin_lg, "lime"),
+    ]
+    if superpoint_row is not None:
+        feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg = superpoint_row
+        rows.append(
+            (
+                superpoint_label or "SuperPoint",
+                feats0_sp,
+                feats1_sp,
+                matches_sp_nn,
+                matches_sp_lg,
+                "orange",
+            )
+        )
+
+    return image0_np, image1_np, rows
+
+
+def main() -> int:
+    args = parse_args()
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("CUDA requested but not available.", file=sys.stderr)
+        return 1
+
+    global DEVICE
+    DEVICE = torch.device(args.device)
+    torch.set_grad_enabled(False)
+
+    dataset_root = Path(args.dataset).resolve()
+    image_sets = gather_image_sets(dataset_root, args.dataset_name)
+
+    extractor_sift = SIFT(
+        max_num_keypoints=args.sift_max_keypoints,
+        detection_threshold=args.sift_contrast_threshold,
+        edge_threshold=args.sift_edge_threshold,
+        num_octaves=args.sift_n_octave_layers,
+        backend="opencv",
+    ).eval().to(DEVICE)
+    matcher_sift_lg = LightGlue(
+        features="sift",
+        filter_threshold=args.lightglue_filter_threshold,
+        depth_confidence=args.lightglue_depth_confidence,
+        width_confidence=args.lightglue_width_confidence,
     ).eval().to(DEVICE)
 
-matching_folder = './assets/matching/examples'
-output_folder = './matching_outputs'
-superpoint_folder_name = (
-    f"{SUPERPOINT_MODEL_NAME}_{Path(SUPERPOINT_WEIGHTS_PATH).stem}_{SUPERPOINT_DETECTION_THRESHOLD}"
-    if SUPERPOINT_MODEL_NAME and SUPERPOINT_WEIGHTS_PATH
-    else 'no_superpoint'
-)
-output_root = os.path.join(output_folder, superpoint_folder_name)
-os.makedirs(output_root, exist_ok=True)
+    superpoint_extractor = None
+    matcher_superpoint_lg = None
+    if args.superpoint_weights_path:
+        weights_path = Path(args.superpoint_weights_path).expanduser()
+        if not weights_path.exists():
+            print(f"SuperPoint weights not found: {weights_path}", file=sys.stderr)
+            return 1
+        superpoint_extractor = SuperPointFromWeights(
+            args.superpoint_model_name,
+            str(weights_path),
+            device=DEVICE,
+            max_num_keypoints=args.superpoint_max_keypoints,
+            detection_threshold=args.superpoint_detection_threshold,
+        ).eval()
+        matcher_superpoint_lg = LightGlue(
+            features="superpoint",
+            filter_threshold=args.lightglue_filter_threshold,
+            depth_confidence=args.lightglue_depth_confidence,
+            width_confidence=args.lightglue_width_confidence,
+        ).eval().to(DEVICE)
 
+    output_root = Path(args.output_dir).expanduser().resolve() / args.run_name
+    output_root.mkdir(parents=True, exist_ok=True)
 
-def is_image_file(name):
-    ext = os.path.splitext(name)[1].lower()
-    return ext in (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+    for folder, images in image_sets:
+        out_subfolder = output_root / folder.name
+        out_subfolder.mkdir(parents=True, exist_ok=True)
+        print(f"Processing {folder} -> {out_subfolder}")
 
-
-# iterate over subfolders and match all pairs per subfolder
-for entry in os.scandir(matching_folder):
-    if not entry.is_dir():
-        continue
-
-    subfolder = entry.path
-    images = [
-        os.path.join(subfolder, f.name)
-        for f in os.scandir(subfolder)
-        if f.is_file() and is_image_file(f.name)
-    ]
-    images.sort()
-    if len(images) < 2:
-        continue
-
-    out_subfolder = os.path.join(output_root, os.path.basename(subfolder))
-    os.makedirs(out_subfolder, exist_ok=True)
-
-    for img_path0, img_path1 in combinations(images, 2):
-        print(f"[DEBUG] image0 shape={tuple(image0.shape)} image1 shape={tuple(image1.shape)}")
-        image0 = load_image(img_path0).to(DEVICE)
-        image1 = load_image(img_path1).to(DEVICE)
-
-        print(f"Matching {img_path0} and {img_path1}")
-
-        image0_np = image0.permute(1, 2, 0).cpu().numpy()
-        image1_np = image1.permute(1, 2, 0).cpu().numpy()
-
-        feats0_sift, feats1_sift, matches_sift_lg_batch = match_pair(extractor_sift, matcher_sift_lg, image0, image1)
-        feats0_sift = detach_to_cpu(feats0_sift)
-        feats1_sift = detach_to_cpu(feats1_sift)
-        matches_sift_lg = lightglue_matches_to_tensor(matches_sift_lg_batch['matches'])
-        matches_sift_nn = run_nn_matching(feats0_sift, feats1_sift, NN_MATCH_THRESHOLD)
-
-        def image_to_bin_path(img_path: str) -> str:
-            base, _ = os.path.splitext(img_path)
-            return f"{base}_sift.bin"
-
-        image_size = feats0_sift['image_size']
-        feats0_bin_raw = load_sift_bin(image_to_bin_path(img_path0), image_size)
-        feats1_bin_raw = load_sift_bin(image_to_bin_path(img_path1), image_size)
-        matches_bin_lg_batch = matcher_sift_lg({"image0": feats0_bin_raw, "image1": feats1_bin_raw})
-        feats0_bin = detach_to_cpu(rbd(feats0_bin_raw))
-        feats1_bin = detach_to_cpu(rbd(feats1_bin_raw))
-        matches_bin_lg = lightglue_matches_to_tensor(rbd(matches_bin_lg_batch)['matches'])
-        matches_bin_nn = run_nn_matching(feats0_bin, feats1_bin, NN_MATCH_THRESHOLD)
-
-        superpoint_row = None
-        if superpoint_extractor is not None:
-            feats0_sp_lg, feats1_sp_lg, matches_sp_lg_batch = match_pair(
+        for img_path0, img_path1 in itertools.combinations(images, 2):
+            image0_np, image1_np, rows = process_pair(
+                img_path0,
+                img_path1,
+                args.downscale,
+                extractor_sift,
+                matcher_sift_lg,
                 superpoint_extractor,
                 matcher_superpoint_lg,
-                image0,
-                image1,
+                args.nn_match_threshold,
+                args.sift_lowe_thresh,
+                args.superpoint_model_name if superpoint_extractor is not None else None,
             )
-            feats0_sp = detach_to_cpu(feats0_sp_lg)
-            feats1_sp = detach_to_cpu(feats1_sp_lg)
-            matches_sp_lg = lightglue_matches_to_tensor(matches_sp_lg_batch['matches'])
-            matches_sp_nn = run_nn_matching(feats0_sp, feats1_sp, NN_MATCH_THRESHOLD)
-            superpoint_row = (feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg)
 
-        rows = [
-            ("SIFT", feats0_sift, feats1_sift, matches_sift_nn, matches_sift_lg, LG_MATCH_COLOR),
-            ("CudaSIFT", feats0_bin, feats1_bin, matches_bin_nn, matches_bin_lg, LG_MATCH_COLOR),
-        ]
-        if superpoint_row is not None:
-            feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg = superpoint_row
-            rows.append((SUPERPOINT_MODEL_NAME or "SuperPoint", feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg, SUPERPOINT_MATCH_COLOR))
+            rows_nn_counts = [matches_nn.shape[0] for _, _, _, matches_nn, _, _ in rows]
+            rows_lg_counts = [matches_lg.shape[0] for _, _, _, _, matches_lg, _ in rows]
+            print(
+                f"  Pair {img_path0.name} vs {img_path1.name}: "
+                f"NN matches {rows_nn_counts}, LG matches {rows_lg_counts}"
+            )
 
-        rows_nn_counts = [matches_nn_row.shape[0] for _, _, _, matches_nn_row, _, _ in rows]
-        rows_lg_counts = [matches_lg_row.shape[0] for _, _, _, _, matches_lg_row, _ in rows]
-        print(f'[DEBUG] NN counts per row: {rows_nn_counts}')
-        print(f'[DEBUG] LG counts per row: {rows_lg_counts}')
+            fig, axes = plt.subplots(len(rows), 4, figsize=(16, 4 * len(rows)))
+            axes = np.atleast_2d(axes)
 
-        fig, axes = plt.subplots(len(rows), 4, figsize=(16, 4 * len(rows)))
-        axes = np.atleast_2d(axes)
+            for row_idx, (label, feats0_row, feats1_row, matches_nn_row, matches_lg_row, lg_color) in enumerate(rows):
+                nn_left, nn_right = axes[row_idx, 0], axes[row_idx, 1]
+                lg_left, lg_right = axes[row_idx, 2], axes[row_idx, 3]
+                prepare_axes(nn_left, nn_right, image0_np, image1_np)
+                prepare_axes(lg_left, lg_right, image0_np, image1_np)
+                plot_matches_on_axes(
+                    nn_left,
+                    nn_right,
+                    feats0_row,
+                    feats1_row,
+                    matches_nn_row,
+                    f"{label}+NN"
+                )
+                plot_matches_on_axes(
+                    lg_left,
+                    lg_right,
+                    feats0_row,
+                    feats1_row,
+                    matches_lg_row,
+                    f"{label}+LG",
+                    lg_color,
+                )
 
-        for row_idx, (label, feats0_row, feats1_row, matches_nn_row, matches_lg_row, lg_color) in enumerate(rows):
-            nn_left, nn_right = axes[row_idx, 0], axes[row_idx, 1]
-            lg_left, lg_right = axes[row_idx, 2], axes[row_idx, 3]
-            prepare_axes(nn_left, nn_right, image0_np, image1_np)
-            prepare_axes(lg_left, lg_right, image0_np, image1_np)
-            plot_matches_on_axes(nn_left, nn_right, feats0_row, feats1_row, matches_nn_row, f"{label}+NN", NN_MATCH_COLOR)
-            plot_matches_on_axes(lg_left, lg_right, feats0_row, feats1_row, matches_lg_row, f"{label}+LG", lg_color)
+            fig.tight_layout(pad=0.5)
+            base0 = img_path0.stem
+            base1 = img_path1.stem
+            out_path = out_subfolder / f"{base0}__{base1}.png"
+            viz2d.save_plot(str(out_path))
+            plt.close(fig)
 
-        fig.tight_layout(pad=0.5)
+    print(f"All comparisons saved under {output_root}")
+    return 0
 
-        base0 = os.path.splitext(os.path.basename(img_path0))[0]
-        base1 = os.path.splitext(os.path.basename(img_path1))[0]
-        out_path = os.path.join(out_subfolder, f"{base0}__{base1}.png")
-        viz2d.save_plot(out_path)
-        print(f"Saved matches to {out_path}")
-        plt.close(fig)
+
+if __name__ == "__main__":
+    raise SystemExit(main())

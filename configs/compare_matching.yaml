@@ -1,0 +1,27 @@
+# Default options for compare_matching.py
+
+dataset: ./assets/matching
+# dataset_name: 1a
+output_dir: ./matching_outputs
+run_name: compare_matching
+
+downscale: 1
+
+lightglue_filter_threshold: 0.1
+lightglue_depth_confidence: -1
+lightglue_width_confidence: -1
+
+sift_lowe_thresh: 0.75
+sift_max_keypoints: 2048
+sift_contrast_threshold: 0.00025
+sift_edge_threshold: 100.0
+sift_n_octave_layers: 8
+
+nn_match_threshold: 0.7
+
+superpoint_model_name: MagicLeap
+superpoint_weights_path: ./weights/MagicLeap/superpoint_v1.pth
+superpoint_max_keypoints: 2048
+superpoint_detection_threshold: 0.015
+
+device: cuda
