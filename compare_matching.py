@@ -500,7 +500,8 @@ def process_pair(
     nn_threshold: float,
     ratio_thresh: Optional[float],
     superpoint_label: Optional[str],
-) -> Tuple[np.ndarray, np.ndarray, List[Tuple[str, dict, dict, torch.Tensor, torch.Tensor, str]]]:
+    cuda_dataset_root: Path,
+) -> List[Tuple[str, dict, dict, torch.Tensor, torch.Tensor, np.ndarray, np.ndarray]]:
     image0 = load_preprocessed_image(image0_path, downscale)
     image1 = load_preprocessed_image(image1_path, downscale)
     image0_np = image0.permute(1, 2, 0).cpu().numpy()
@@ -515,9 +516,11 @@ def process_pair(
     def image_to_bin_path(path: Path) -> Path:
         return path.with_name(path.stem + "_sift.bin")
 
+    cuda_image0_path = cuda_dataset_root / image0_path.name
+    cuda_image1_path = cuda_dataset_root / image1_path.name
     image_size = feats0_sift["image_size"]
-    feats0_bin_raw = load_sift_bin(image_to_bin_path(image0_path), image_size)
-    feats1_bin_raw = load_sift_bin(image_to_bin_path(image1_path), image_size)
+    feats0_bin_raw = load_sift_bin(image_to_bin_path(cuda_image0_path), image_size)
+    feats1_bin_raw = load_sift_bin(image_to_bin_path(cuda_image1_path), image_size)
     matches_bin_lg_batch = matcher_sift_lg({"image0": feats0_bin_raw, "image1": feats1_bin_raw})
     feats0_bin = detach_to_cpu(rbd(feats0_bin_raw))
     feats1_bin = detach_to_cpu(rbd(feats1_bin_raw))
@@ -540,9 +543,12 @@ def process_pair(
         matches_sp_nn = run_nn_matching(feats0_sp, feats1_sp, nn_threshold, ratio_thresh)
         superpoint_row = (feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg)
 
+    cuda_image0_np = load_preprocessed_image(cuda_image0_path, downscale).permute(1, 2, 0).cpu().numpy()
+    cuda_image1_np = load_preprocessed_image(cuda_image1_path, downscale).permute(1, 2, 0).cpu().numpy()
+
     rows = [
-        ("SIFT", feats0_sift, feats1_sift, matches_sift_nn, matches_sift_lg),
-        ("CudaSIFT", feats0_bin, feats1_bin, matches_bin_nn, matches_bin_lg),
+        ("SIFT", feats0_sift, feats1_sift, matches_sift_nn, matches_sift_lg, image0_np, image1_np),
+        ("CudaSIFT", feats0_bin, feats1_bin, matches_bin_nn, matches_bin_lg, cuda_image0_np, cuda_image1_np),
     ]
     if superpoint_row is not None:
         feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg = superpoint_row
@@ -553,10 +559,12 @@ def process_pair(
                 feats1_sp,
                 matches_sp_nn,
                 matches_sp_lg,
+                image0_np,
+                image1_np,
             )
         )
 
-    return image0_np, image1_np, rows
+    return rows
 
 
 def main() -> int:
@@ -643,13 +651,18 @@ def main() -> int:
             width_confidence=args.lightglue_width_confidence,
         ).eval().to(DEVICE)
 
+    cuda_dataset_root = Path(args.cuda_sift_dataset or "./assets/matching/no_crop_1440x1080").resolve()
+    if not cuda_dataset_root.exists():
+        print(f"CudaSIFT dataset not found: {cuda_dataset_root}", file=sys.stderr)
+        return 1
+
     for folder, images in image_sets:
         out_subfolder = run_root / folder.name
         out_subfolder.mkdir(parents=True, exist_ok=True)
         print(f"Processing {folder} -> {out_subfolder}")
 
         for img_path0, img_path1 in itertools.combinations(images, 2):
-            image0_np, image1_np, rows = process_pair(
+            rows = process_pair(
                 img_path0,
                 img_path1,
                 args.downscale,
@@ -660,10 +673,11 @@ def main() -> int:
                 args.nn_match_threshold,
                 args.sift_lowe_thresh,
                 args.superpoint_model_name if superpoint_extractor is not None else None,
+                cuda_dataset_root,
             )
 
-            rows_nn_counts = [matches_nn.shape[0] for _, _, _, matches_nn, _ in rows]
-            rows_lg_counts = [matches_lg.shape[0] for _, _, _, _, matches_lg in rows]
+            rows_nn_counts = [matches_nn.shape[0] for _, _, _, matches_nn, _, _ in rows]
+            rows_lg_counts = [matches_lg.shape[0] for _, _, _, _, matches_lg, _, _ in rows]
             print(
                 f"  Pair {img_path0.name} vs {img_path1.name}: "
                 f"NN matches {rows_nn_counts}, LG matches {rows_lg_counts}"
@@ -672,11 +686,11 @@ def main() -> int:
             fig, axes = plt.subplots(len(rows), 4, figsize=(16, 4 * len(rows)))
             axes = np.atleast_2d(axes)
 
-            for row_idx, (label, feats0_row, feats1_row, matches_nn_row, matches_lg_row) in enumerate(rows):
+            for row_idx, (label, feats0_row, feats1_row, matches_nn_row, matches_lg_row, img0_np, img1_np) in enumerate(rows):
                 nn_left, nn_right = axes[row_idx, 0], axes[row_idx, 1]
                 lg_left, lg_right = axes[row_idx, 2], axes[row_idx, 3]
-                prepare_axes(nn_left, nn_right, image0_np, image1_np)
-                prepare_axes(lg_left, lg_right, image0_np, image1_np)
+                prepare_axes(nn_left, nn_right, img0_np, img1_np)
+                prepare_axes(lg_left, lg_right, img0_np, img1_np)
                 plot_matches_on_axes(
                     nn_left,
                     nn_right,
