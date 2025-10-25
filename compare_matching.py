@@ -415,8 +415,6 @@ def parse_args() -> argparse.Namespace:
             + ", ".join(missing)
         )
 
-    if opt.run_name is None:
-        opt.run_name = "compare_matching"
 
     return opt
 
@@ -555,11 +553,11 @@ def main() -> int:
     if args.output_dir is None:
         weights_token = weights_path.stem if weights_path.name else "weights"
         args.output_dir = (
-            f"{dataset_token}_{args.superpoint_model_name}_{weights_token}_{args.superpoint_detection_threshold}"
+            f"./matching_outputs/{dataset_token}_{args.superpoint_model_name}_{weights_token}_{args.superpoint_detection_threshold}"
         )
 
     output_base = Path(args.output_dir).expanduser().resolve()
-    run_root = output_base / args.run_name
+    run_root = output_base
     if run_root.exists():
         raise RuntimeError(
             f"Output directory '{run_root}' already exists. Please choose a different --run-name."

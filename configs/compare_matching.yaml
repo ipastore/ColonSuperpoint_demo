@@ -1,7 +1,6 @@
 # Default options for compare_matching.py
 
-dataset: ./assets/matching/1a
-run_name: compare_matching
+dataset: ./assets/matching/crop_1350x1012_test/
 
 downscale: 1
 
