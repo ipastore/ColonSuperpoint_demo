@@ -201,8 +201,33 @@ def plot_matches_on_axes(
             matched_kpts0, matched_kpts1, color=match_color, lw=0.2, axes=(ax_left, ax_right)
         )
 
+    kp_left = keypoints0.shape[0]
+    kp_right = keypoints1.shape[0]
+
     ax_left.set_title(f"{title_prefix}: {matched_kpts0.shape[0]} matches", fontsize=10)
+    ax_left.text(
+        0.01,
+        0.99,
+        f"kpts: {kp_left}",
+        transform=ax_left.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color="white",
+        bbox=dict(facecolor="black", alpha=0.4, edgecolor="none", pad=2),
+    )
     ax_right.set_title("")
+    ax_right.text(
+        0.99,
+        0.99,
+        f"kpts: {kp_right}",
+        transform=ax_right.transAxes,
+        ha="right",
+        va="top",
+        fontsize=9,
+        color="white",
+        bbox=dict(facecolor="black", alpha=0.4, edgecolor="none", pad=2),
+    )
 
 
 def load_sift_bin(path, image_size):
@@ -338,7 +363,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--downscale",
         type=int,
-        choices=[1, 2, 4, 6],
+        choices=[1, 2, 4, 8],
         default=None,
         help="Image downscale factor (1 leaves original size)",
     )
