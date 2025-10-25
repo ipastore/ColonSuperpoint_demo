@@ -414,7 +414,8 @@ def parse_args() -> argparse.Namespace:
             "Missing required options (provide via CLI or config): "
             + ", ".join(missing)
         )
-
+    if opt.run_name is None:
+        opt.run_name = "default"
 
     return opt
 
@@ -550,19 +551,35 @@ def main() -> int:
 
     weights_path = Path(args.superpoint_weights_path).expanduser()
     dataset_token = dataset_root.name
-    if args.output_dir is None:
-        weights_token = weights_path.stem if weights_path.name else "weights"
-        args.output_dir = (
-            f"./matching_outputs/{dataset_token}_{args.superpoint_model_name}_{weights_token}_{args.superpoint_detection_threshold}"
-        )
-
-    output_base = Path(args.output_dir).expanduser().resolve()
-    run_root = output_base
+    weights_token = weights_path.stem if weights_path.name else "weights"
+    run_token = args.run_name or "default"
+    base_dir = (
+        Path(args.output_dir).expanduser().resolve()
+        if args.output_dir
+        else Path("./matching_outputs").resolve()
+    )
+    run_root = base_dir / (
+        f"{dataset_token}_{args.superpoint_model_name}_{weights_token}_{args.superpoint_detection_threshold}_{run_token}"
+    )
     if run_root.exists():
         raise RuntimeError(
             f"Output directory '{run_root}' already exists. Please choose a different --run-name."
         )
     run_root.mkdir(parents=True, exist_ok=False)
+
+    config_snapshot = {
+        key: (str(value) if isinstance(value, Path) else value)
+        for key, value in vars(args).items()
+    }
+    config_snapshot.update(
+        {
+            "dataset_resolved": str(dataset_root),
+            "superpoint_weights_resolved": str(weights_path),
+            "run_directory": str(run_root),
+        }
+    )
+    snapshot_path = run_root / "config_used.yaml"
+    snapshot_path.write_text(yaml.safe_dump(config_snapshot, sort_keys=True))
 
     extractor_sift = SIFT(
         max_num_keypoints=args.sift_max_keypoints,
