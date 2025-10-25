@@ -7,7 +7,7 @@ import itertools
 import struct
 import sys
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -35,6 +35,9 @@ from utils.LightGlue.lightglue.utils import (
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+NN_MATCH_COLOR = "dodgerblue"
+LG_MATCH_COLOR = "lime"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
 
@@ -319,125 +322,54 @@ def parse_args() -> argparse.Namespace:
     default_device = "cuda" if torch.cuda.is_available() else "cpu"
 
     parser = argparse.ArgumentParser(parents=[config_parser], description=__doc__)
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default="./assets/matching/",
-        help="Path to the dataset root (default: ./assets/matching)",
-    )
-    parser.add_argument(
-        "--dataset-name",
-        type=str,
-        default=None,
-        help="Optional subfolder name inside --dataset to evaluate",
-    )
+    parser.add_argument("--dataset", type=str, default=None, help="Path to the dataset root")
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./matching_outputs",
+        default=None,
         help="Destination directory for comparison figures",
     )
     parser.add_argument(
         "--run-name",
         type=str,
-        default="compare_matching",
+        default=None,
         help="Name of the run/output subfolder",
     )
     parser.add_argument(
         "--downscale",
         type=int,
         choices=[1, 2, 4, 6],
-        default=1,
+        default=None,
         help="Image downscale factor (1 leaves original size)",
     )
-    parser.add_argument(
-        "--lightglue-filter-threshold",
-        type=float,
-        default=0.1,
-        help="LightGlue filter threshold",
-    )
-    parser.add_argument(
-        "--lightglue-depth-confidence",
-        type=float,
-        default=-1,
-        help="LightGlue depth confidence",
-    )
-    parser.add_argument(
-        "--lightglue-width-confidence",
-        type=float,
-        default=-1,
-        help="LightGlue width confidence",
-    )
-    parser.add_argument(
-        "--sift-lowe-thresh",
-        type=float,
-        default=0.75,
-        help="Lowe ratio threshold for NN matcher",
-    )
-    parser.add_argument(
-        "--sift-max-keypoints",
-        type=int,
-        default=2048,
-        help="Max keypoints for the SIFT extractor",
-    )
-    parser.add_argument(
-        "--sift-contrast-threshold",
-        type=float,
-        default=0.00025,
-        help="SIFT contrast threshold",
-    )
-    parser.add_argument(
-        "--sift-edge-threshold",
-        type=float,
-        default=100.0,
-        help="SIFT edge threshold",
-    )
-    parser.add_argument(
-        "--sift-n-octave-layers",
-        type=int,
-        default=8,
-        help="Number of octave layers for SIFT",
-    )
-    parser.add_argument(
-        "--nn-match-threshold",
-        type=float,
-        default=0.7,
-        help="Descriptor distance threshold for NN matcher",
-    )
+    parser.add_argument("--lightglue-filter-threshold", type=float, default=None)
+    parser.add_argument("--lightglue-depth-confidence", type=float, default=None)
+    parser.add_argument("--lightglue-width-confidence", type=float, default=None)
+    parser.add_argument("--sift-lowe-thresh", type=float, default=None)
+    parser.add_argument("--sift-max-keypoints", type=int, default=None)
+    parser.add_argument("--sift-contrast-threshold", type=float, default=None)
+    parser.add_argument("--sift-edge-threshold", type=float, default=None)
+    parser.add_argument("--sift-n-octave-layers", type=int, default=None)
+    parser.add_argument("--nn-match-threshold", type=float, default=None)
     parser.add_argument(
         "--superpoint-model-name",
         type=str,
-        default="MagicLeap",
+        default=None,
         choices=SUPERPOINT_MODEL_CHOICES,
-        help="SuperPoint model variant",
     )
-    parser.add_argument(
-        "--superpoint-weights-path",
-        type=str,
-        default="./weights/MagicLeap/superpoint_v1.pth",
-        help="Path to SuperPoint weights",
-    )
-    parser.add_argument(
-        "--superpoint-max-keypoints",
-        type=int,
-        default=2048,
-        help="Max SuperPoint keypoints",
-    )
-    parser.add_argument(
-        "--superpoint-detection-threshold",
-        type=float,
-        default=0.015,
-        help="SuperPoint detection threshold",
-    )
+    parser.add_argument("--superpoint-weights-path", type=str, default=None)
+    parser.add_argument("--superpoint-max-keypoints", type=int, default=None)
+    parser.add_argument("--superpoint-detection-threshold", type=float, default=None)
     parser.add_argument(
         "--device",
         type=str,
         choices=["cpu", "cuda"],
-        default=default_device,
+        default=None,
         help="Computation device",
     )
 
     config_args, remaining = config_parser.parse_known_args()
+    config_data = {}
     if config_args.config:
         config_path = Path(config_args.config)
         if not config_path.exists():
@@ -445,30 +377,68 @@ def parse_args() -> argparse.Namespace:
         config_data = yaml.safe_load(config_path.read_text()) or {}
         if not isinstance(config_data, dict):
             parser.error("Config file must map option names to values.")
-        parser.set_defaults(**config_data)
 
     opt = parser.parse_args(remaining)
     opt.config = config_args.config
+
+    for key, value in config_data.items():
+        if getattr(opt, key, None) is None:
+            setattr(opt, key, value)
+
+    if opt.device is None:
+        opt.device = default_device
+
+    missing = [
+        name
+        for name in [
+            "dataset",
+            "downscale",
+            "lightglue_filter_threshold",
+            "lightglue_depth_confidence",
+            "lightglue_width_confidence",
+            "sift_lowe_thresh",
+            "sift_max_keypoints",
+            "sift_contrast_threshold",
+            "sift_edge_threshold",
+            "sift_n_octave_layers",
+            "nn_match_threshold",
+            "superpoint_model_name",
+            "superpoint_weights_path",
+            "superpoint_max_keypoints",
+            "superpoint_detection_threshold",
+        ]
+        if getattr(opt, name, None) is None
+    ]
+    if missing:
+        parser.error(
+            "Missing required options (provide via CLI or config): "
+            + ", ".join(missing)
+        )
+
+    if opt.run_name is None:
+        opt.run_name = "compare_matching"
+
     return opt
 
 
-def gather_image_sets(root: Path, dataset_name: Optional[str]) -> List[Tuple[Path, List[Path]]]:
-    if dataset_name:
-        target = root / dataset_name
-        if not target.exists():
-            raise FileNotFoundError(f"Dataset subfolder not found: {target}")
-        candidates = [target]
-    else:
-        subdirs = [p for p in root.iterdir() if p.is_dir()]
-        candidates = subdirs if subdirs else [root]
+def gather_image_sets(root: Path) -> List[Tuple[Path, List[Path]]]:
+    if not root.exists():
+        raise FileNotFoundError(f"Dataset not found: {root}")
 
-    image_sets: List[Tuple[Path, List[Path]]] = []
-    for folder in candidates:
-        images = sorted(
+    def image_list(folder: Path) -> List[Path]:
+        return sorted(
             [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS]
         )
+
+    primary_images = image_list(root)
+    if len(primary_images) >= 2:
+        return [(root, primary_images)]
+
+    image_sets: List[Tuple[Path, List[Path]]] = []
+    for sub in sorted(p for p in root.iterdir() if p.is_dir()):
+        images = image_list(sub)
         if len(images) >= 2:
-            image_sets.append((folder, images))
+            image_sets.append((sub, images))
     if not image_sets:
         raise RuntimeError(f"No valid image folders found under {root}")
     return image_sets
@@ -549,8 +519,8 @@ def process_pair(
         superpoint_row = (feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg)
 
     rows = [
-        ("SIFT", feats0_sift, feats1_sift, matches_sift_nn, matches_sift_lg, "lime"),
-        ("CudaSIFT", feats0_bin, feats1_bin, matches_bin_nn, matches_bin_lg, "lime"),
+        ("SIFT", feats0_sift, feats1_sift, matches_sift_nn, matches_sift_lg),
+        ("CudaSIFT", feats0_bin, feats1_bin, matches_bin_nn, matches_bin_lg),
     ]
     if superpoint_row is not None:
         feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg = superpoint_row
@@ -561,7 +531,6 @@ def process_pair(
                 feats1_sp,
                 matches_sp_nn,
                 matches_sp_lg,
-                "orange",
             )
         )
 
@@ -579,7 +548,23 @@ def main() -> int:
     torch.set_grad_enabled(False)
 
     dataset_root = Path(args.dataset).resolve()
-    image_sets = gather_image_sets(dataset_root, args.dataset_name)
+    image_sets = gather_image_sets(dataset_root)
+
+    weights_path = Path(args.superpoint_weights_path).expanduser()
+    dataset_token = dataset_root.name
+    if args.output_dir is None:
+        weights_token = weights_path.stem if weights_path.name else "weights"
+        args.output_dir = (
+            f"{dataset_token}_{args.superpoint_model_name}_{weights_token}_{args.superpoint_detection_threshold}"
+        )
+
+    output_base = Path(args.output_dir).expanduser().resolve()
+    run_root = output_base / args.run_name
+    if run_root.exists():
+        raise RuntimeError(
+            f"Output directory '{run_root}' already exists. Please choose a different --run-name."
+        )
+    run_root.mkdir(parents=True, exist_ok=False)
 
     extractor_sift = SIFT(
         max_num_keypoints=args.sift_max_keypoints,
@@ -598,7 +583,6 @@ def main() -> int:
     superpoint_extractor = None
     matcher_superpoint_lg = None
     if args.superpoint_weights_path:
-        weights_path = Path(args.superpoint_weights_path).expanduser()
         if not weights_path.exists():
             print(f"SuperPoint weights not found: {weights_path}", file=sys.stderr)
             return 1
@@ -616,11 +600,8 @@ def main() -> int:
             width_confidence=args.lightglue_width_confidence,
         ).eval().to(DEVICE)
 
-    output_root = Path(args.output_dir).expanduser().resolve() / args.run_name
-    output_root.mkdir(parents=True, exist_ok=True)
-
     for folder, images in image_sets:
-        out_subfolder = output_root / folder.name
+        out_subfolder = run_root / folder.name
         out_subfolder.mkdir(parents=True, exist_ok=True)
         print(f"Processing {folder} -> {out_subfolder}")
 
@@ -638,8 +619,8 @@ def main() -> int:
                 args.superpoint_model_name if superpoint_extractor is not None else None,
             )
 
-            rows_nn_counts = [matches_nn.shape[0] for _, _, _, matches_nn, _, _ in rows]
-            rows_lg_counts = [matches_lg.shape[0] for _, _, _, _, matches_lg, _ in rows]
+            rows_nn_counts = [matches_nn.shape[0] for _, _, _, matches_nn, _ in rows]
+            rows_lg_counts = [matches_lg.shape[0] for _, _, _, _, matches_lg in rows]
             print(
                 f"  Pair {img_path0.name} vs {img_path1.name}: "
                 f"NN matches {rows_nn_counts}, LG matches {rows_lg_counts}"
@@ -648,7 +629,7 @@ def main() -> int:
             fig, axes = plt.subplots(len(rows), 4, figsize=(16, 4 * len(rows)))
             axes = np.atleast_2d(axes)
 
-            for row_idx, (label, feats0_row, feats1_row, matches_nn_row, matches_lg_row, lg_color) in enumerate(rows):
+            for row_idx, (label, feats0_row, feats1_row, matches_nn_row, matches_lg_row) in enumerate(rows):
                 nn_left, nn_right = axes[row_idx, 0], axes[row_idx, 1]
                 lg_left, lg_right = axes[row_idx, 2], axes[row_idx, 3]
                 prepare_axes(nn_left, nn_right, image0_np, image1_np)
@@ -659,7 +640,8 @@ def main() -> int:
                     feats0_row,
                     feats1_row,
                     matches_nn_row,
-                    f"{label}+NN"
+                    f"{label}+NN",
+                    NN_MATCH_COLOR,
                 )
                 plot_matches_on_axes(
                     lg_left,
@@ -668,7 +650,7 @@ def main() -> int:
                     feats1_row,
                     matches_lg_row,
                     f"{label}+LG",
-                    lg_color,
+                    LG_MATCH_COLOR,
                 )
 
             fig.tight_layout(pad=0.5)
@@ -678,7 +660,7 @@ def main() -> int:
             viz2d.save_plot(str(out_path))
             plt.close(fig)
 
-    print(f"All comparisons saved under {output_root}")
+    print(f"All comparisons saved under {run_root}")
     return 0
 
 

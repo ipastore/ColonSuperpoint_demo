@@ -1,8 +1,6 @@
 # Default options for compare_matching.py
 
-dataset: ./assets/matching
-# dataset_name: 1a
-output_dir: ./matching_outputs
+dataset: ./assets/matching/1a
 run_name: compare_matching
 
 downscale: 1
