@@ -439,8 +439,6 @@ def parse_args() -> argparse.Namespace:
             "Missing required options (provide via CLI or config): "
             + ", ".join(missing)
         )
-    if opt.run_name is None:
-        opt.run_name = "default"
 
     return opt
 
@@ -577,15 +575,20 @@ def main() -> int:
     weights_path = Path(args.superpoint_weights_path).expanduser()
     dataset_token = dataset_root.name
     weights_token = weights_path.stem if weights_path.name else "weights"
-    run_token = args.run_name or "default"
     base_dir = (
         Path(args.output_dir).expanduser().resolve()
         if args.output_dir
         else Path("./matching_outputs").resolve()
     )
-    run_root = base_dir / (
-        f"{dataset_token}_{args.superpoint_model_name}_{weights_token}_{args.superpoint_detection_threshold}_{run_token}"
-    )
+    if args.run_name:
+        run_token = args.run_name
+        run_root = base_dir / (
+            f"{dataset_token}_{args.superpoint_model_name}_{weights_token}_spth{args.superpoint_detection_threshold}_{run_token}"
+        )
+    else:
+        run_root = base_dir / (
+            f"{dataset_token}_{args.superpoint_model_name}_{weights_token}_spth{args.superpoint_detection_threshold}"
+        )
     if run_root.exists():
         raise RuntimeError(
             f"Output directory '{run_root}' already exists. Please choose a different --run-name."

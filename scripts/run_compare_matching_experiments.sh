@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Defaults
 CONFIG=${1:-./configs/compare_matching.yaml}
 PYTHON_BIN=${PYTHON_BIN:-python}
-dataset = "./assets/matching/crop_1350x1012"
-downscale = 1
-lg_thresh = 0.1
+dataset="./assets/matching/crop_1350x1012"
+downscale=1
+lg_thresh=0.1
 # Model comparison (edit weights as needed)
 declare -A MODEL_WEIGHTS=(
   [MagicLeap]="./weights/MagicLeap/superpoint_v1.pth"
@@ -26,8 +27,9 @@ for model in "${!MODEL_WEIGHTS[@]}"; do
   # SuperPoint detection threshold sweep
   for sp_thresh in 0.005 0.0005; do
     if [[ -f "$weight" ]]; then
-      run_exp --superpoint-model-name "$model" --superpoint-weights-path "$weight" --superpoint-detection-threshold "$sp_thresh" --run-name "spth_${sp_thresh}"
+      run_exp --superpoint-model-name "$model" --superpoint-weights-path "$weight" --superpoint-detection-threshold "$sp_thresh"
     else
       echo "[WARN] Skipping $model (missing weights at $weight)" >&2
     fi
+  done
 done
