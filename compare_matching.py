@@ -417,6 +417,7 @@ def parse_args() -> argparse.Namespace:
         name
         for name in [
             "dataset",
+            "cuda_sift_dataset",
             "downscale",
             "lightglue_filter_threshold",
             "lightglue_depth_confidence",
@@ -516,8 +517,8 @@ def process_pair(
     def image_to_bin_path(path: Path) -> Path:
         return path.with_name(path.stem + "_sift.bin")
 
-    cuda_image0_path = cuda_dataset_root / image0_path.name
-    cuda_image1_path = cuda_dataset_root / image1_path.name
+    cuda_image0_path = cuda_dataset_root / image0_path.parent.name / image0_path.name
+    cuda_image1_path = cuda_dataset_root / image1_path.parent.name / image1_path.name
     image_size = feats0_sift["image_size"]
     feats0_bin_raw = load_sift_bin(image_to_bin_path(cuda_image0_path), image_size)
     feats1_bin_raw = load_sift_bin(image_to_bin_path(cuda_image1_path), image_size)
@@ -674,13 +675,6 @@ def main() -> int:
                 args.sift_lowe_thresh,
                 args.superpoint_model_name if superpoint_extractor is not None else None,
                 cuda_dataset_root,
-            )
-
-            rows_nn_counts = [matches_nn.shape[0] for _, _, _, matches_nn, _, _ in rows]
-            rows_lg_counts = [matches_lg.shape[0] for _, _, _, _, matches_lg, _, _ in rows]
-            print(
-                f"  Pair {img_path0.name} vs {img_path1.name}: "
-                f"NN matches {rows_nn_counts}, LG matches {rows_lg_counts}"
             )
 
             fig, axes = plt.subplots(len(rows), 4, figsize=(16, 4 * len(rows)))

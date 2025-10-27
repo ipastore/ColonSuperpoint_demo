@@ -1,11 +1,11 @@
 # AGENTS.md
 
-This document tells the coding agent **how to work in this repository**: environment setup, build & test and PR workflow. It is aligned with `.github/copilot-instructions.md`. Remember to open a new branch with the name of the feature or the bug.
+This document tells the coding agent **how to work in this repository**: environment setup, build & test and PR workflow. Remember to open a new branch with the name of the feature or the bug.
 
 
 ## 1) Repository layout
 
-- Top repo: **colon_matching** (this repo: Superpoint: SP).
+- Top repo: **ColonSuperpoint_demo** (this repo: Superpoint: SP).
 - Sub repo: **utils/ColonSuperGlue_demo** (the superglue (SG) demo cloned without being a git submodule).
   - SG contains a more advanced demo by the same researchers. It serves as inspiration
 

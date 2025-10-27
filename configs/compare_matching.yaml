@@ -1,6 +1,7 @@
 # Default options for compare_matching.py
 
 dataset: ./assets/matching/crop_1350x1012/
+cuda_sift_dataset: ./assets/matching/no_crop_1440x1080
 
 downscale: 1
 
