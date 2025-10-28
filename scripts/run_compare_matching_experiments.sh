@@ -7,6 +7,7 @@ PYTHON_BIN=${PYTHON_BIN:-python}
 dataset="./assets/matching/crop_1350x1012"
 downscale=1
 lg_thresh=0.1
+nn_thresh=0.7
 
 # Model comparison (edit weights as needed). Use list of "model|weight" entries to allow duplicates.
 MODEL_WEIGHTS=(
@@ -20,7 +21,7 @@ MODEL_WEIGHTS=(
 
 run_exp() {
   echo "[RUN] $PYTHON_BIN compare_matching.py --config $CONFIG $*"
-  $PYTHON_BIN compare_matching.py --config "$CONFIG" "$@" --dataset "$dataset" --downscale "$downscale" --lightglue-filter-threshold "$lg_thresh"
+  $PYTHON_BIN compare_matching.py --config "$CONFIG" "$@" --dataset "$dataset" --downscale "$downscale" --lightglue-filter-threshold "$lg_thresh" --nn-match-threshold "$nn_thresh"
 }
 
 for entry in "${MODEL_WEIGHTS[@]}"; do
