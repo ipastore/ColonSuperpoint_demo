@@ -99,85 +99,66 @@ def nn_match_two_way(
 
 
 def bf_nn_bidirectional(
-        desc1: np.ndarray,
-        desc2: np.ndarray,
-        nn_thresh: Optional[float] = None,
-        ratio_thresh: Optional[float] = None,
-        ) -> np.ndarray:
-    """
-    Performs two-way nearest neighbor matching of two sets of descriptors, such
-    that the NN match from descriptor A->B must equal the NN match from B->A.
+    desc1: np.ndarray,
+    desc2: np.ndarray,
+    nn_thresh: Optional[float] = None,
+    ratio_nn_thresh: Optional[float] = None,
+) -> np.ndarray:
+    """Return two-way nearest-neighbour matches with optional distance and ratio filtering.
 
-    Inputs:
-      desc1 - NxM numpy matrix of N corresponding M-dimensional descriptors.
-      desc2 - NxM numpy matrix of N corresponding M-dimensional descriptors.
-      nn_thresh - Optional descriptor distance below which is a good match.
+    Args:
+        desc1: (D, N1) descriptor matrix.
+        desc2: (D, N2) descriptor matrix.
+        nn_thresh: Optional Euclidean distance threshold for matches.
+        ratio_nn_thresh: Optional Lowe-style ratio threshold between best and second best.
 
     Returns:
-      matches - 3xL numpy array, of L matches, where L <= N and each column i is
-                a match of two descriptors, d_i in image 1 and d_j' in image 2:
-                [d_i index, d_j' index, match_score]^T
+        A (3, K) array with indices and match scores [idx0, idx1, distance].
     """
-    
     assert desc1.shape[0] == desc2.shape[0], "Descriptor dimensions must match."
     if desc1.shape[1] == 0 or desc2.shape[1] == 0:
-        return np.zeros((3,0))
+        return np.zeros((3, 0), dtype=np.float32)
 
-    # Normalize descriptors
-    desc1 = desc1 / np.linalg.norm(desc1)
-    desc2 = desc2 / np.linalg.norm(desc2)
+    if nn_thresh is not None and nn_thresh < 0.0:
+        raise ValueError("nn_thresh should be non-negative")
 
-    # Compute cosine distance: all vs all
-    cos_distance = np.dot(desc1.T,desc2)
+    desc1_norm = np.maximum(np.linalg.norm(desc1, axis=0, keepdims=True), 1e-9)
+    desc2_norm = np.maximum(np.linalg.norm(desc2, axis=0, keepdims=True), 1e-9)
+    desc1 = desc1 / desc1_norm
+    desc2 = desc2 / desc2_norm
 
-    # Convert to euclidian distance 
-    euc_distance = np.sqrt(2 - 2 * np.clip(cos_distance, -1, 1))
+    cosine_sim = np.dot(desc1.T, desc2)
+    euc_distance = np.sqrt(np.maximum(0.0, 2 - 2 * np.clip(cosine_sim, -1, 1)))
 
-    # Rearrange de indixes for first and second best idx
-    two_best_idx_12 = np.argpartition(euc_distance,1,axis=1)
-    two_best_idx_21 = np.argpartition(euc_distance,1,axis=0)
+    idx12 = np.argmin(euc_distance, axis=1)
+    best_scores = euc_distance[np.arange(euc_distance.shape[0]), idx12]
 
-    #Take first and second best indexs
-    best_idx12 = two_best_idx_12[:,0]
-    second_best_idx12 = two_best_idx_12[:,1]
-    best_idx21 = two_best_idx_21[0,:]
-
-    # Take best score from image 1 to image 2
-    best_scores_idx12 = euc_distance[np.arange(euc_distance[0]),best_idx12]
-    second_best_scores_idx12 = euc_distance[np.arange(euc_distance[0]),second_best_idx12]
-
-    # Threshold the NN matches: Optional
+    keep_thresh = np.ones_like(best_scores, dtype=bool)
     if nn_thresh is not None:
-        keep_thresh = best_scores_idx12 < nn_thresh
-    else:
-        keep_thresh = np.ones(euc_distance[0], dtype=bool)
-    
-    # Check the ratio of the distance of the first against the second: Optional
-    if ratio_thresh is not None:
-        ratio_12 = best_scores_idx12 / (second_best_scores_idx12 + 1e-9)
-        keep_ratio = ratio_12 < ratio_thresh
-    else:
-        keep_ratio = np.ones(euc_distance[0], dtype=bool)
+        keep_thresh = best_scores < nn_thresh
 
-    # Check bidirectionality
-    keep_bi = np.arange(len(best_idx12)) == best_idx21[best_idx12]
-    
-    # Apply all filters
-    keep = np.logical_and(keep_thresh,keep_ratio,keep_bi)
+    keep_ratio = np.ones_like(best_scores, dtype=bool)
+    if ratio_nn_thresh is not None and euc_distance.shape[1] > 1:
+        partition = np.partition(euc_distance, 1, axis=1)
+        second_best = partition[:, 1]
+        ratio = best_scores / np.maximum(second_best, 1e-9)
+        keep_ratio = ratio < ratio_nn_thresh
+
+    idx21 = np.argmin(euc_distance, axis=0)
+    keep_bi = np.arange(idx12.shape[0]) == idx21[idx12]
+
+    keep = keep_thresh & keep_ratio & keep_bi
     idx12 = idx12[keep]
-    scores = best_scores_idx12[keep]
+    scores = best_scores[keep]
 
-    # Get the surviving point indices
     m_idx12 = np.arange(desc1.shape[1])[keep]
     m_idx21 = idx12
-    
-    # Populate the final 3xN match data structure.
+
     matches = np.zeros((3, int(keep.sum())), dtype=np.float32)
     matches[0, :] = m_idx12
     matches[1, :] = m_idx21
     matches[2, :] = scores
-
-    return matches 
+    return matches
 
 
 
@@ -213,9 +194,19 @@ def descriptors_to_matrix(feats: dict) -> np.ndarray:
 
 
 def run_nn_matching(
-    feats0: dict, feats1: dict, threshold: float, ratio_thresh: Optional[float]
+    feats0: dict, feats1: dict, threshold: float, ratio_nn_thresh: Optional[float]
 ) -> torch.Tensor:
-    """Compute two-way NN matches with optional ratio_thresh and return indices as a tensor of shape (K, 2)."""
+    """Compute two-way NN matches with optional ratio filtering.
+
+    Args:
+        feats0: Feature dictionary for the first image.
+        feats1: Feature dictionary for the second image.
+        threshold: Euclidean distance threshold for accepting matches.
+        ratio_nn_thresh: Optional Lowe-style ratio threshold.
+
+    Returns:
+        A (K, 2) tensor containing the retained match indices.
+    """
 
     # Return descriptors as a (D, N) float32 array for NN matching
     desc0 = descriptors_to_matrix(feats0)
@@ -223,7 +214,7 @@ def run_nn_matching(
     if desc0.size == 0 or desc1.size == 0:
         return torch.empty((0, 2), dtype=torch.long)
     # matches = nn_match_two_way(desc0, desc1, threshold)
-    matches = bf_nn_bidirectional(desc0, desc1, threshold)
+    matches = bf_nn_bidirectional(desc0, desc1, threshold, ratio_nn_thresh)
     if matches.shape[1] == 0:
         return torch.empty((0, 2), dtype=torch.long)
     return torch.from_numpy(matches[:2].T.astype(np.int64))
@@ -472,7 +463,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lightglue-filter-threshold", type=float, default=None)
     parser.add_argument("--lightglue-depth-confidence", type=float, default=None)
     parser.add_argument("--lightglue-width-confidence", type=float, default=None)
-    parser.add_argument("--sift-lowe-thresh", type=float, default=None)
+    parser.add_argument(
+        "--ratio-nn-thresh",
+        type=float,
+        default=None,
+        help="Lowe-style ratio threshold for NN matching (applied when provided).",
+    )
     parser.add_argument("--sift-max-keypoints", type=int, default=None)
     parser.add_argument("--sift-contrast-threshold", type=float, default=None)
     parser.add_argument("--sift-edge-threshold", type=float, default=None)
@@ -524,12 +520,11 @@ def parse_args() -> argparse.Namespace:
             "lightglue_filter_threshold",
             "lightglue_depth_confidence",
             "lightglue_width_confidence",
-            "sift_lowe_thresh",
             "sift_max_keypoints",
             "sift_contrast_threshold",
             "sift_edge_threshold",
             "sift_n_octave_layers",
-            "nn_match_threshold",
+            # "nn_match_threshold",
             "superpoint_model_name",
             "superpoint_weights_path",
             "superpoint_max_keypoints",
@@ -601,7 +596,7 @@ def process_pair(
     superpoint_extractor: Optional[SuperPointFromWeights],
     matcher_superpoint_lg: Optional[LightGlue],
     nn_threshold: float,
-    ratio_thresh: Optional[float],
+    ratio_nn_thresh: Optional[float],
     superpoint_label: Optional[str],
     cuda_dataset_root: Path,
 ) -> List[Tuple[str, dict, dict, torch.Tensor, torch.Tensor, np.ndarray, np.ndarray]]:
@@ -622,7 +617,7 @@ def process_pair(
 
     
     # Match SIFT features with NN
-    matches_sift_nn = run_nn_matching(feats0_sift, feats1_sift, nn_threshold, ratio_thresh)
+    matches_sift_nn = run_nn_matching(feats0_sift, feats1_sift, nn_threshold, ratio_nn_thresh)
 
     # Extract CudaSIFT features from .bin files
     def image_to_bin_path(path: Path) -> Path:
@@ -640,7 +635,7 @@ def process_pair(
     feats0_bin = rescale_feature_dict(feats0_bin, downscale)
     feats1_bin = rescale_feature_dict(feats1_bin, downscale)
     matches_bin_lg = lightglue_matches_to_tensor(rbd(matches_bin_lg_batch)["matches"])
-    matches_bin_nn = run_nn_matching(feats0_bin, feats1_bin, nn_threshold, ratio_thresh)
+    matches_bin_nn = run_nn_matching(feats0_bin, feats1_bin, nn_threshold, ratio_nn_thresh)
 
     superpoint_row = None
     if superpoint_extractor is not None and matcher_superpoint_lg is not None:
@@ -653,7 +648,7 @@ def process_pair(
         feats0_sp = detach_to_cpu(feats0_sp)
         feats1_sp = detach_to_cpu(feats1_sp)
         matches_sp_lg = lightglue_matches_to_tensor(matches_sp_lg_batch["matches"])
-        matches_sp_nn = run_nn_matching(feats0_sp, feats1_sp, nn_threshold, ratio_thresh)
+        matches_sp_nn = run_nn_matching(feats0_sp, feats1_sp, nn_threshold, ratio_nn_thresh)
         superpoint_row = (feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg)
 
     cuda_image0_np = load_preprocessed_image(cuda_image0_path, downscale).permute(1, 2, 0).cpu().numpy()
@@ -704,12 +699,15 @@ def main() -> int:
     if args.run_name:
         run_token = args.run_name
         run_root = base_dir / (
-            f"{dataset_token}_{args.superpoint_model_name}_{weights_token}_spth{args.superpoint_detection_threshold}_{run_token}"
-        )
+            f"{args.superpoint_model_name}") / (
+            f"{weights_token}_{run_token}"
+            )
+        
     else:
         run_root = base_dir / (
-            f"{dataset_token}_{args.superpoint_model_name}_{weights_token}_spth{args.superpoint_detection_threshold}"
-        )
+            f"{args.superpoint_model_name}") / (
+            f"{weights_token}"
+            )
     if run_root.exists():
         raise RuntimeError(
             f"Output directory '{run_root}' already exists. Please choose a different --run-name."
@@ -784,7 +782,7 @@ def main() -> int:
                 superpoint_extractor,
                 matcher_superpoint_lg,
                 args.nn_match_threshold,
-                args.sift_lowe_thresh,
+                args.ratio_nn_thresh,
                 args.superpoint_model_name if superpoint_extractor is not None else None,
                 cuda_dataset_root,
             )

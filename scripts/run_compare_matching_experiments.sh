@@ -6,8 +6,10 @@ CONFIG=${1:-./configs/compare_matching.yaml}
 PYTHON_BIN=${PYTHON_BIN:-python}
 dataset="./assets/matching/crop_1350x1012"
 downscale=1
-lg_thresh=0.1
-nn_thresh=0.7
+lg_thresh=0.05
+sp_thresh=0.0005
+nn_thresh=0.9
+ratio_thresh=0.9
 
 # Model comparison (edit weights as needed). Use list of "model|weight" entries to allow duplicates.
 MODEL_WEIGHTS=(
@@ -21,18 +23,28 @@ MODEL_WEIGHTS=(
 
 run_exp() {
   echo "[RUN] $PYTHON_BIN compare_matching.py --config $CONFIG $*"
-  $PYTHON_BIN compare_matching.py --config "$CONFIG" "$@" --dataset "$dataset" --downscale "$downscale" --lightglue-filter-threshold "$lg_thresh" --nn-match-threshold "$nn_thresh"
+  $PYTHON_BIN compare_matching.py --config "$CONFIG" "$@" --dataset "$dataset" --downscale "$downscale" --lightglue-filter-threshold "$lg_thresh" --superpoint-detection-threshold "$sp_thresh"
 }
 
 for entry in "${MODEL_WEIGHTS[@]}"; do
   IFS='|' read -r model weight <<< "$entry"
+
+  # for ratio_thresh in 0.7 0.8 0.9 1; do
   
-  # SuperPoint detection threshold sweep
-  for sp_thresh in 0.005 0.0005; do
     if [[ -f "$weight" ]]; then
-      run_exp --superpoint-model-name "$model" --superpoint-weights-path "$weight" --superpoint-detection-threshold "$sp_thresh"
-    else
+      # # bi 
+      # run_exp --superpoint-model-name "$model" --superpoint-weights-path "$weight" --output-dir "bi"
+      
+      # # bi_ratio
+      # run_exp --superpoint-model-name "$model" --superpoint-weights-path "$weight" --ratio-nn-thresh "$ratio_thresh" --output-dir "bi_ratio_$ratio_thresh"
+      
+      # # bi_nn_thresh
+      # run_exp --superpoint-model-name "$model" --superpoint-weights-path "$weight" --nn-match-threshold "$nn_thresh" --output-dir "bi_nn_thresh_$nn_thresh"
+      
+      # bi_ratio_nn_thresh
+      run_exp --superpoint-model-name "$model" --superpoint-weights-path "$weight" --ratio-nn-thresh "$ratio_thresh" --nn-match-threshold "$nn_thresh" --output-dir "bi_ratio${ratio_thresh}_nn-thresh${nn_thresh}"
+      else
       echo "[WARN] Skipping $model (missing weights at $weight)" >&2
-    fi
-  done
+     fi
+  # done
 done
