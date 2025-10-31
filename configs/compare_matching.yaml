@@ -5,7 +5,7 @@ cuda_sift_dataset: ./assets/matching/no_crop_1440x1080
 
 downscale: 1
 
-lightglue_filter_threshold: 0.1
+lightglue_filter_threshold: 0.05
 lightglue_depth_confidence: -1
 lightglue_width_confidence: -1
 
@@ -15,11 +15,11 @@ sift_contrast_threshold: 0.00025
 sift_edge_threshold: 100.0
 sift_n_octave_layers: 8
 
-nn_match_threshold: 0.7
+nn_match_threshold: 1
 
 superpoint_model_name: MagicLeap
 superpoint_weights_path: ./weights/MagicLeap/superpoint_v1.pth
-superpoint_max_keypoints: 2048
-superpoint_detection_threshold: 0.015
+superpoint_max_keypoints: 5000
+superpoint_detection_threshold: 0.0015
 
 device: cuda

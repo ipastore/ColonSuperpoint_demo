@@ -36,7 +36,7 @@ from utils.LightGlue.lightglue.utils import (
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-NN_MATCH_COLOR = "dodgerblue"
+NN_MATCH_COLOR = "blue"
 LG_MATCH_COLOR = "lime"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -46,40 +46,139 @@ def nn_match_two_way(
     desc1: np.ndarray,
     desc2: np.ndarray,
     nn_thresh: float,
-    ratio_thresh: Optional[float] = None,
 ) -> np.ndarray:
-    """Two-way nearest-neighbour matching with optional Lowe ratio filtering."""
+    """
+    Performs two-way nearest neighbor matching of two sets of descriptors, such
+    that the NN match from descriptor A->B must equal the NN match from B->A.
 
+    Inputs:
+      desc1 - NxM numpy matrix of N corresponding M-dimensional descriptors.
+      desc2 - NxM numpy matrix of N corresponding M-dimensional descriptors.
+      nn_thresh - Optional descriptor distance below which is a good match.
+
+    Returns:
+      matches - 3xL numpy array, of L matches, where L <= N and each column i is
+                a match of two descriptors, d_i in image 1 and d_j' in image 2:
+                [d_i index, d_j' index, match_score]^T
+    """
     assert desc1.shape[0] == desc2.shape[0], "Descriptor dimensions must match."
     if desc1.shape[1] == 0 or desc2.shape[1] == 0:
         return np.zeros((3, 0))
     if nn_thresh < 0.0:
         raise ValueError("nn_thresh should be non-negative")
 
+    #Normalize descriptors (double check)
+    desc1_norm = np.linalg.norm(desc1, axis=0, keepdims=True)
+    desc2_norm = np.linalg.norm(desc2, axis=0, keepdims=True)
+    desc1 = desc1 / desc1_norm
+    desc2 = desc2 / desc2_norm
+
+    # Compute L2 distance. Easy since vectors are unit normalized.
     dmat = np.dot(desc1.T, desc2)
     dmat = np.sqrt(2 - 2 * np.clip(dmat, -1, 1))
+    # Get NN indices and scores.
     idx = np.argmin(dmat, axis=1)
     scores = dmat[np.arange(dmat.shape[0]), idx]
+    # Threshold the NN matches.
     keep = scores < nn_thresh
+    # Check if nearest neighbor goes both directions and keep those.
     idx2 = np.argmin(dmat, axis=0)
     keep_bi = np.arange(len(idx)) == idx2[idx]
     keep = np.logical_and(keep, keep_bi)
-
-    if ratio_thresh is not None and ratio_thresh < 1.0 and desc2.shape[1] > 1:
-        second_best = np.partition(dmat, 1, axis=1)[:, 1]
-        second_best = np.clip(second_best, 1e-12, None)
-        ratios = scores / second_best
-        keep = np.logical_and(keep, ratios <= ratio_thresh)
-
     idx = idx[keep]
     scores = scores[keep]
+    # Get the surviving point indices.
     m_idx1 = np.arange(desc1.shape[1])[keep]
     m_idx2 = idx
+    # Populate the final 3xN match data structure.
     matches = np.zeros((3, int(keep.sum())), dtype=np.float32)
     matches[0, :] = m_idx1
     matches[1, :] = m_idx2
     matches[2, :] = scores
     return matches
+
+
+def bf_nn_bidirectional(
+        desc1: np.ndarray,
+        desc2: np.ndarray,
+        nn_thresh: Optional[float] = None,
+        ratio_thresh: Optional[float] = None,
+        ) -> np.ndarray:
+    """
+    Performs two-way nearest neighbor matching of two sets of descriptors, such
+    that the NN match from descriptor A->B must equal the NN match from B->A.
+
+    Inputs:
+      desc1 - NxM numpy matrix of N corresponding M-dimensional descriptors.
+      desc2 - NxM numpy matrix of N corresponding M-dimensional descriptors.
+      nn_thresh - Optional descriptor distance below which is a good match.
+
+    Returns:
+      matches - 3xL numpy array, of L matches, where L <= N and each column i is
+                a match of two descriptors, d_i in image 1 and d_j' in image 2:
+                [d_i index, d_j' index, match_score]^T
+    """
+    
+    assert desc1.shape[0] == desc2.shape[0], "Descriptor dimensions must match."
+    if desc1.shape[1] == 0 or desc2.shape[1] == 0:
+        return np.zeros((3,0))
+
+    # Normalize descriptors
+    desc1 = desc1 / np.linalg.norm(desc1)
+    desc2 = desc2 / np.linalg.norm(desc2)
+
+    # Compute cosine distance: all vs all
+    cos_distance = np.dot(desc1.T,desc2)
+
+    # Convert to euclidian distance 
+    euc_distance = np.sqrt(2 - 2 * np.clip(cos_distance, -1, 1))
+
+    # Rearrange de indixes for first and second best idx
+    two_best_idx_12 = np.argpartition(euc_distance,1,axis=1)
+    two_best_idx_21 = np.argpartition(euc_distance,1,axis=0)
+
+    #Take first and second best indexs
+    best_idx12 = two_best_idx_12[:,0]
+    second_best_idx12 = two_best_idx_12[:,1]
+    best_idx21 = two_best_idx_21[0,:]
+
+    # Take best score from image 1 to image 2
+    best_scores_idx12 = euc_distance[np.arange(euc_distance[0]),best_idx12]
+    second_best_scores_idx12 = euc_distance[np.arange(euc_distance[0]),second_best_idx12]
+
+    # Threshold the NN matches: Optional
+    if nn_thresh is not None:
+        keep_thresh = best_scores_idx12 < nn_thresh
+    else:
+        keep_thresh = np.ones(euc_distance[0], dtype=bool)
+    
+    # Check the ratio of the distance of the first against the second: Optional
+    if ratio_thresh is not None:
+        ratio_12 = best_scores_idx12 / (second_best_scores_idx12 + 1e-9)
+        keep_ratio = ratio_12 < ratio_thresh
+    else:
+        keep_ratio = np.ones(euc_distance[0], dtype=bool)
+
+    # Check bidirectionality
+    keep_bi = np.arange(len(best_idx12)) == best_idx21[best_idx12]
+    
+    # Apply all filters
+    keep = np.logical_and(keep_thresh,keep_ratio,keep_bi)
+    idx12 = idx12[keep]
+    scores = best_scores_idx12[keep]
+
+    # Get the surviving point indices
+    m_idx12 = np.arange(desc1.shape[1])[keep]
+    m_idx21 = idx12
+    
+    # Populate the final 3xN match data structure.
+    matches = np.zeros((3, int(keep.sum())), dtype=np.float32)
+    matches[0, :] = m_idx12
+    matches[1, :] = m_idx21
+    matches[2, :] = scores
+
+    return matches 
+
 
 
 def detach_to_cpu(data: dict) -> dict:
@@ -117,11 +216,14 @@ def run_nn_matching(
     feats0: dict, feats1: dict, threshold: float, ratio_thresh: Optional[float]
 ) -> torch.Tensor:
     """Compute two-way NN matches with optional ratio_thresh and return indices as a tensor of shape (K, 2)."""
+
+    # Return descriptors as a (D, N) float32 array for NN matching
     desc0 = descriptors_to_matrix(feats0)
     desc1 = descriptors_to_matrix(feats1)
     if desc0.size == 0 or desc1.size == 0:
         return torch.empty((0, 2), dtype=torch.long)
-    matches = nn_match_two_way(desc0, desc1, threshold, ratio_thresh)
+    # matches = nn_match_two_way(desc0, desc1, threshold)
+    matches = bf_nn_bidirectional(desc0, desc1, threshold)
     if matches.shape[1] == 0:
         return torch.empty((0, 2), dtype=torch.long)
     return torch.from_numpy(matches[:2].T.astype(np.int64))
@@ -503,25 +605,35 @@ def process_pair(
     superpoint_label: Optional[str],
     cuda_dataset_root: Path,
 ) -> List[Tuple[str, dict, dict, torch.Tensor, torch.Tensor, np.ndarray, np.ndarray]]:
+    
+    # Load image with resize similar to lightglue preprocess
     image0 = load_preprocessed_image(image0_path, downscale)
     image1 = load_preprocessed_image(image1_path, downscale)
+    
+    # Convert to numpy for visualization
     image0_np = image0.permute(1, 2, 0).cpu().numpy()
     image1_np = image1.permute(1, 2, 0).cpu().numpy()
 
+    #Extract SIFT features and match with LightGLue
     feats0_sift, feats1_sift, matches_sift_lg_batch = match_pair(extractor_sift, matcher_sift_lg, image0, image1)
     feats0_sift = detach_to_cpu(feats0_sift)
     feats1_sift = detach_to_cpu(feats1_sift)
     matches_sift_lg = lightglue_matches_to_tensor(matches_sift_lg_batch["matches"])
+
+    
+    # Match SIFT features with NN
     matches_sift_nn = run_nn_matching(feats0_sift, feats1_sift, nn_threshold, ratio_thresh)
 
+    # Extract CudaSIFT features from .bin files
     def image_to_bin_path(path: Path) -> Path:
         return path.with_name(path.stem + "_sift.bin")
-
     cuda_image0_path = cuda_dataset_root / image0_path.parent.name / image0_path.name
     cuda_image1_path = cuda_dataset_root / image1_path.parent.name / image1_path.name
     image_size = feats0_sift["image_size"]
     feats0_bin_raw = load_sift_bin(image_to_bin_path(cuda_image0_path), image_size)
     feats1_bin_raw = load_sift_bin(image_to_bin_path(cuda_image1_path), image_size)
+
+    # Match CudaSIFT features with LightGLue and NN
     matches_bin_lg_batch = matcher_sift_lg({"image0": feats0_bin_raw, "image1": feats1_bin_raw})
     feats0_bin = detach_to_cpu(rbd(feats0_bin_raw))
     feats1_bin = detach_to_cpu(rbd(feats1_bin_raw))
