@@ -1,0 +1,21 @@
+dataset: ./assets/matching/crop_1350x1012/
+cuda_sift_dataset: ./assets/matching/no_crop_1440x1080
+
+output_dir: ./matching_outputs/lightglue_weights
+run_name: null
+
+downscale: 1
+
+lightglue_filter_threshold: 0.05
+lightglue_depth_confidence: -1
+lightglue_width_confidence: -1
+
+sift_max_keypoints: 2048
+sift_contrast_threshold: 0.00025
+sift_edge_threshold: 100.0
+sift_n_octave_layers: 8
+
+left_weights: null
+right_weights: weights/lightglue/e23_checkpoint_best.pth
+
+device: cuda

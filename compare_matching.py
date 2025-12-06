@@ -582,8 +582,17 @@ def rescale_feature_dict(feats: dict, factor: int) -> dict:
     scale = 1.0 / factor
     if "keypoints" in feats and isinstance(feats["keypoints"], torch.Tensor):
         feats["keypoints"] = feats["keypoints"] * scale
+    if "scales" in feats and isinstance(feats["scales"], torch.Tensor):
+        feats["scales"] = feats["scales"] * scale
     if "image_size" in feats and isinstance(feats["image_size"], torch.Tensor):
         feats["image_size"] = feats["image_size"] * scale
+    return feats
+
+
+def harmonize_sift_scales(feats: dict, backend: str) -> dict:
+    """Ensure SIFT scales are expressed as sigma (not diameter) for OpenCV backend."""
+    if backend == "opencv" and "scales" in feats and isinstance(feats["scales"], torch.Tensor):
+        feats["scales"] = feats["scales"] * 0.5
     return feats
 
 
@@ -609,11 +618,16 @@ def process_pair(
     image0_np = image0.permute(1, 2, 0).cpu().numpy()
     image1_np = image1.permute(1, 2, 0).cpu().numpy()
 
-    #Extract SIFT features and match with LightGLue
-    feats0_sift, feats1_sift, matches_sift_lg_batch = match_pair(extractor_sift, matcher_sift_lg, image0, image1)
-    feats0_sift = detach_to_cpu(feats0_sift)
-    feats1_sift = detach_to_cpu(feats1_sift)
-    matches_sift_lg = lightglue_matches_to_tensor(matches_sift_lg_batch["matches"])
+    # Patch for downscaling the scales of OpenCV instead of using directly match_pair
+    # Extract SIFT features, convert OpenCV scales to sigma, and match with LightGlue
+    feats0_sift = extractor_sift.extract(image0)
+    feats1_sift = extractor_sift.extract(image1)
+    feats0_sift = harmonize_sift_scales(feats0_sift, extractor_sift.conf.backend)
+    feats1_sift = harmonize_sift_scales(feats1_sift, extractor_sift.conf.backend)
+    matches_sift_lg_batch = matcher_sift_lg({"image0": feats0_sift, "image1": feats1_sift})
+    feats0_sift = detach_to_cpu(rbd(feats0_sift))
+    feats1_sift = detach_to_cpu(rbd(feats1_sift))
+    matches_sift_lg = lightglue_matches_to_tensor(rbd(matches_sift_lg_batch)["matches"])
 
     
     # Match SIFT features with NN
