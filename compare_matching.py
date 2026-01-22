@@ -1,11 +1,13 @@
-"""CLI tool to compare SIFT/CudaSIFT and SuperPoint matches using LightGlue and NN."""
+"""CLI tool to compare SIFT/CudaSIFT/SuperPoint/DISK/ALIKED matches using LightGlue and NN."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import itertools
 import struct
 import sys
+import time
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -17,7 +19,7 @@ import yaml
 from kornia.color import rgb_to_grayscale
 
 from models import SUPERPOINT_MODEL_CHOICES, build_superpoint_model
-from utils.LightGlue.lightglue import LightGlue, SIFT
+from utils.LightGlue.lightglue import ALIKED, DISK, LightGlue, SIFT
 from utils.LightGlue.lightglue import viz2d
 from utils.LightGlue.lightglue.superpoint import (
     sample_descriptors,
@@ -27,7 +29,6 @@ from utils.LightGlue.lightglue.superpoint import (
 from utils.LightGlue.lightglue.utils import (
     Extractor,
     load_image,
-    match_pair,
     rbd,
     read_image,
     resize_image,
@@ -473,6 +474,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sift-contrast-threshold", type=float, default=None)
     parser.add_argument("--sift-edge-threshold", type=float, default=None)
     parser.add_argument("--sift-n-octave-layers", type=int, default=None)
+    parser.add_argument("--disk-max-keypoints", type=int, default=None)
+    parser.add_argument("--disk-detection-threshold", type=float, default=None)
+    parser.add_argument("--aliked-max-keypoints", type=int, default=None)
+    parser.add_argument("--aliked-detection-threshold", type=float, default=None)
     parser.add_argument("--nn-match-threshold", type=float, default=None)
     parser.add_argument(
         "--superpoint-model-name",
@@ -524,6 +529,10 @@ def parse_args() -> argparse.Namespace:
             "sift_contrast_threshold",
             "sift_edge_threshold",
             "sift_n_octave_layers",
+            "disk_max_keypoints",
+            "disk_detection_threshold",
+            "aliked_max_keypoints",
+            "aliked_detection_threshold",
             # "nn_match_threshold",
             "superpoint_model_name",
             "superpoint_weights_path",
@@ -596,18 +605,43 @@ def harmonize_sift_scales(feats: dict, backend: str) -> dict:
     return feats
 
 
+def timed_extract(
+    extractor: Extractor,
+    image: torch.Tensor,
+    label: str,
+    time_sums: dict,
+    time_counts: dict,
+) -> dict:
+    """Run extractor on image and accumulate timing stats per label."""
+    if image.device.type == "cuda":
+        torch.cuda.synchronize()
+    start = time.perf_counter()
+    feats = extractor.extract(image)
+    if image.device.type == "cuda":
+        torch.cuda.synchronize()
+    time_sums[label] += time.perf_counter() - start
+    time_counts[label] += 1
+    return feats
+
+
 def process_pair(
     image0_path: Path,
     image1_path: Path,
     downscale: int,
     extractor_sift: SIFT,
     matcher_sift_lg: LightGlue,
+    extractor_disk: DISK,
+    matcher_disk_lg: LightGlue,
+    extractor_aliked: ALIKED,
+    matcher_aliked_lg: LightGlue,
     superpoint_extractor: Optional[SuperPointFromWeights],
     matcher_superpoint_lg: Optional[LightGlue],
     nn_threshold: float,
     ratio_nn_thresh: Optional[float],
     superpoint_label: Optional[str],
     cuda_dataset_root: Path,
+    time_sums: dict,
+    time_counts: dict,
 ) -> List[Tuple[str, dict, dict, torch.Tensor, torch.Tensor, np.ndarray, np.ndarray]]:
     
     # Load image with resize similar to lightglue preprocess
@@ -620,8 +654,8 @@ def process_pair(
 
     # Patch for downscaling the scales of OpenCV instead of using directly match_pair
     # Extract SIFT features, convert OpenCV scales to sigma, and match with LightGlue
-    feats0_sift = extractor_sift.extract(image0)
-    feats1_sift = extractor_sift.extract(image1)
+    feats0_sift = timed_extract(extractor_sift, image0, "SIFT", time_sums, time_counts)
+    feats1_sift = timed_extract(extractor_sift, image1, "SIFT", time_sums, time_counts)
     feats0_sift = harmonize_sift_scales(feats0_sift, extractor_sift.conf.backend)
     feats1_sift = harmonize_sift_scales(feats1_sift, extractor_sift.conf.backend)
     matches_sift_lg_batch = matcher_sift_lg({"image0": feats0_sift, "image1": feats1_sift})
@@ -651,17 +685,67 @@ def process_pair(
     matches_bin_lg = lightglue_matches_to_tensor(rbd(matches_bin_lg_batch)["matches"])
     matches_bin_nn = run_nn_matching(feats0_bin, feats1_bin, nn_threshold, ratio_nn_thresh)
 
+    disk_row = None
+    if extractor_disk is not None and matcher_disk_lg is not None:
+        feats0_disk = timed_extract(
+            extractor_disk, image0, "DISK", time_sums, time_counts
+        )
+        feats1_disk = timed_extract(
+            extractor_disk, image1, "DISK", time_sums, time_counts
+        )
+
+        matches_disk_lg_batch = matcher_disk_lg(
+            {"image0": feats0_disk, "image1": feats1_disk}
+        )
+        feats0_disk = detach_to_cpu(rbd(feats0_disk))
+        feats1_disk = detach_to_cpu(rbd(feats1_disk))
+        matches_disk_lg = lightglue_matches_to_tensor(
+            rbd(matches_disk_lg_batch)["matches"]
+        )
+        matches_disk_nn = run_nn_matching(
+            feats0_disk, feats1_disk, nn_threshold, ratio_nn_thresh
+        )
+        disk_row = (feats0_disk, feats1_disk, matches_disk_nn, matches_disk_lg)
+
+    aliked_row = None
+    if extractor_aliked is not None and matcher_aliked_lg is not None:
+        feats0_aliked = timed_extract(
+            extractor_aliked, image0, "ALIKED", time_sums, time_counts
+        )
+        feats1_aliked = timed_extract(
+            extractor_aliked, image1, "ALIKED", time_sums, time_counts
+        )
+
+        matches_aliked_lg_batch = matcher_aliked_lg(
+            {"image0": feats0_aliked, "image1": feats1_aliked}
+        )
+        feats0_aliked = detach_to_cpu(rbd(feats0_aliked))
+        feats1_aliked = detach_to_cpu(rbd(feats1_aliked))
+        matches_aliked_lg = lightglue_matches_to_tensor(
+            rbd(matches_aliked_lg_batch)["matches"]
+        )
+        matches_aliked_nn = run_nn_matching(
+            feats0_aliked, feats1_aliked, nn_threshold, ratio_nn_thresh
+        )
+        aliked_row = (feats0_aliked, feats1_aliked, matches_aliked_nn, matches_aliked_lg)
+
     superpoint_row = None
     if superpoint_extractor is not None and matcher_superpoint_lg is not None:
-        feats0_sp, feats1_sp, matches_sp_lg_batch = match_pair(
-            superpoint_extractor,
-            matcher_superpoint_lg,
-            image0,
-            image1,
+        feats0_sp = timed_extract(
+            superpoint_extractor, image0, "SuperPoint", time_sums, time_counts
         )
-        feats0_sp = detach_to_cpu(feats0_sp)
-        feats1_sp = detach_to_cpu(feats1_sp)
-        matches_sp_lg = lightglue_matches_to_tensor(matches_sp_lg_batch["matches"])
+        feats1_sp = timed_extract(
+            superpoint_extractor, image1, "SuperPoint", time_sums, time_counts
+        )
+
+        matches_sp_lg_batch = matcher_superpoint_lg(
+            {"image0": feats0_sp, "image1": feats1_sp}
+        )
+        feats0_sp = detach_to_cpu(rbd(feats0_sp))
+        feats1_sp = detach_to_cpu(rbd(feats1_sp))
+        matches_sp_lg = lightglue_matches_to_tensor(
+            rbd(matches_sp_lg_batch)["matches"]
+        )
         matches_sp_nn = run_nn_matching(feats0_sp, feats1_sp, nn_threshold, ratio_nn_thresh)
         superpoint_row = (feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg)
 
@@ -672,6 +756,32 @@ def process_pair(
         ("SIFT", feats0_sift, feats1_sift, matches_sift_nn, matches_sift_lg, image0_np, image1_np),
         ("CudaSIFT", feats0_bin, feats1_bin, matches_bin_nn, matches_bin_lg, cuda_image0_np, cuda_image1_np),
     ]
+    if disk_row is not None:
+        feats0_disk, feats1_disk, matches_disk_nn, matches_disk_lg = disk_row
+        rows.append(
+            (
+                "DISK",
+                feats0_disk,
+                feats1_disk,
+                matches_disk_nn,
+                matches_disk_lg,
+                image0_np,
+                image1_np,
+            )
+        )
+    if aliked_row is not None:
+        feats0_aliked, feats1_aliked, matches_aliked_nn, matches_aliked_lg = aliked_row
+        rows.append(
+            (
+                "ALIKED",
+                feats0_aliked,
+                feats1_aliked,
+                matches_aliked_nn,
+                matches_aliked_lg,
+                image0_np,
+                image1_np,
+            )
+        )
     if superpoint_row is not None:
         feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg = superpoint_row
         rows.append(
@@ -698,6 +808,9 @@ def main() -> int:
     global DEVICE
     DEVICE = torch.device(args.device)
     torch.set_grad_enabled(False)
+
+    time_sums = {"SIFT": 0.0, "DISK": 0.0, "ALIKED": 0.0, "SuperPoint": 0.0}
+    time_counts = {name: 0 for name in time_sums}
 
     dataset_root = Path(args.dataset).resolve()
     image_sets = gather_image_sets(dataset_root)
@@ -756,6 +869,32 @@ def main() -> int:
         width_confidence=args.lightglue_width_confidence,
     ).eval().to(DEVICE)
 
+    disk_conf = {}
+    if args.disk_max_keypoints is not None:
+        disk_conf["max_num_keypoints"] = args.disk_max_keypoints
+    if args.disk_detection_threshold is not None:
+        disk_conf["detection_threshold"] = args.disk_detection_threshold
+    extractor_disk = DISK(**disk_conf).eval().to(DEVICE)
+    matcher_disk_lg = LightGlue(
+        features="disk",
+        filter_threshold=args.lightglue_filter_threshold,
+        depth_confidence=args.lightglue_depth_confidence,
+        width_confidence=args.lightglue_width_confidence,
+    ).eval().to(DEVICE)
+
+    aliked_conf = {}
+    if args.aliked_max_keypoints is not None:
+        aliked_conf["max_num_keypoints"] = args.aliked_max_keypoints
+    if args.aliked_detection_threshold is not None:
+        aliked_conf["detection_threshold"] = args.aliked_detection_threshold
+    extractor_aliked = ALIKED(**aliked_conf).eval().to(DEVICE)
+    matcher_aliked_lg = LightGlue(
+        features="aliked",
+        filter_threshold=args.lightglue_filter_threshold,
+        depth_confidence=args.lightglue_depth_confidence,
+        width_confidence=args.lightglue_width_confidence,
+    ).eval().to(DEVICE)
+
     superpoint_extractor = None
     matcher_superpoint_lg = None
     if args.superpoint_weights_path:
@@ -793,12 +932,18 @@ def main() -> int:
                 args.downscale,
                 extractor_sift,
                 matcher_sift_lg,
+                extractor_disk,
+                matcher_disk_lg,
+                extractor_aliked,
+                matcher_aliked_lg,
                 superpoint_extractor,
                 matcher_superpoint_lg,
                 args.nn_match_threshold,
                 args.ratio_nn_thresh,
                 args.superpoint_model_name if superpoint_extractor is not None else None,
                 cuda_dataset_root,
+                time_sums,
+                time_counts,
             )
 
             fig, axes = plt.subplots(len(rows), 4, figsize=(16, 4 * len(rows)))
@@ -835,7 +980,18 @@ def main() -> int:
             viz2d.save_plot(str(out_path))
             plt.close(fig)
 
+    timing_path = run_root / "timing_report.csv"
+    with timing_path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["extractor", "mean_time_sec", "total_time_sec", "num_images"])
+        for name in ["SIFT", "DISK", "ALIKED", "SuperPoint"]:
+            total = time_sums.get(name, 0.0)
+            count = time_counts.get(name, 0)
+            mean = total / count if count else 0.0
+            writer.writerow([name, f"{mean:.6f}", f"{total:.6f}", count])
+
     print(f"All comparisons saved under {run_root}")
+    print(f"Timing report saved to {timing_path}")
     return 0
 
 

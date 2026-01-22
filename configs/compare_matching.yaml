@@ -10,9 +10,14 @@ lightglue_depth_confidence: -1
 lightglue_width_confidence: -1
 
 sift_max_keypoints: 5000
-sift_contrast_threshold: 5.0e-08
+sift_contrast_threshold: 0.0
 sift_edge_threshold: 10.0
 sift_n_octave_layers: 10
+
+disk_max_keypoints: 5000
+disk_detection_threshold: 0.0
+aliked_max_keypoints: 5000
+aliked_detection_threshold: 0.0
 
 nn_match_threshold: null
 ratio_nn_thresh: null
