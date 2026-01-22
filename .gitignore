@@ -8,3 +8,6 @@ reports/
 matching_outputs/
 .vscode/
 weights/
+utils/
+utils/ColonSuperGlue_demo
+utils/LightGlue
