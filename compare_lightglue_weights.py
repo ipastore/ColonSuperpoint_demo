@@ -527,10 +527,18 @@ def main() -> int:
     matcher_right = load_lightglue_with_weights(right_weights, DEVICE, **matcher_kwargs_right)
     left_checksum = matcher_checksum(matcher_left)
     right_checksum = matcher_checksum(matcher_right)
+    left_params = parameter_count(matcher_left)
+    
+    right_params = parameter_count(matcher_right)
     print(
         f"LightGlue checksum diff (left vs right): {left_checksum != right_checksum} "
         f"(left={left_checksum:.4f}, right={right_checksum:.4f})"
     )
+    print(
+        f"LightGlue parameter count: left={left_params:,}, right={right_params:,}"
+    )
+
+    
 
     sift_kwargs = {"backend": "opencv"}
     if args.sift_max_keypoints is not None:

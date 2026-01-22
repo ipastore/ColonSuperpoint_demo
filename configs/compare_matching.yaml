@@ -9,10 +9,10 @@ lightglue_filter_threshold: 0.05
 lightglue_depth_confidence: -1
 lightglue_width_confidence: -1
 
-sift_max_keypoints: 2048
-sift_contrast_threshold: 0.00025
-sift_edge_threshold: 100.0
-sift_n_octave_layers: 8
+sift_max_keypoints: 5000
+sift_contrast_threshold: 5.0e-08
+sift_edge_threshold: 10.0
+sift_n_octave_layers: 10
 
 nn_match_threshold: null
 ratio_nn_thresh: null

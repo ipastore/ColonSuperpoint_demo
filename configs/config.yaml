@@ -10,9 +10,9 @@ camid: 0                           # Camera index if using live capture
 ############################################################
 # Model & Weights
 ############################################################
-# model: MagicLeap                   # Oficial MAgicLeap
+model: MagicLeap                   # Oficial MAgicLeap
 
-# weights_path: weights/MagicLeap/superpoint_v1.pth  # BASELINE MagicLeap SuperPoint
+weights_path: weights/MagicLeap/superpoint_v1.pth  # BASELINE MagicLeap SuperPoint
 
 ### Mask: only source
 # weights_path: weights/MagicLeap/non_mask_when_training/01_ds4_th000075_nhom10_nms4_Magicleap_bs1_lr00001_th015_nms4_200000_checkpoint.pth    # MagicLeap fine-tuned
@@ -26,7 +26,7 @@ camid: 0                           # Camera index if using live capture
 
 # weights_path: weights/SuperpointNet/leon_esuperPointNet_400000_checkpoint.pth   # Leon s track adaptation
 
-model: SuperpointNet_gauss2      # SuperpoinTorch U-net variant
+# model: SuperpointNet_gauss2      # SuperpoinTorch U-net variant
 
 # weights_path: weights/SuperpointNet_gauss2/superPointNet_gauss2_170000_checkpoint.pth #BASELINE sp-pytorch
 
@@ -45,8 +45,8 @@ model: SuperpointNet_gauss2      # SuperpoinTorch U-net variant
 ############################################################
 # Frame Geometry & Visualization Scaling
 ############################################################
-H: 270                             # 1080 / batch_size. If bs 4, H: 270
-W: 360                             # 1440 / batch_size. If bs 4, W: 360
+H: 540                             # 1080 / batch_size. If bs 4, H: 270
+W: 720                             # 1440 / batch_size. If bs 4, W: 360
 display_scale: 1                   # Multiplicative scale for display windows
 no_display: false                  # Disable all OpenCV UI windows
 
@@ -77,11 +77,11 @@ waitkey: 1                         # OpenCV waitKey delay in ms (frame pacing)
 ############################################################
 # Acceleration Backends
 ############################################################
-cuda: false                        # Enable CUDA backend (if available)
-mps: true                         # Enable Apple Metal Performance Shaders
+cuda: true                        # Enable CUDA backend (if available)
+mps: false                         # Enable Apple Metal Performance Shaders
 
 ############################################################
 # Output & Logging
 ############################################################
-write: false                       # Persist output frames to disk
+write: true                       # Persist output frames to disk
 write_dir: tracker_outputs/  # Destination directory when write=true
