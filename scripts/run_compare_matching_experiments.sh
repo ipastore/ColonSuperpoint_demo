@@ -10,6 +10,7 @@ lg_thresh=0.05
 sp_thresh=0.0
 disk_thresh=0.0
 aliked_thresh=0.0
+aliked_model="aliked-t16"
 nn_thresh=0.9
 ratio_thresh=0.9
 
@@ -27,7 +28,7 @@ MODEL_WEIGHTS=(
 
 run_exp() {
   echo "[RUN] $PYTHON_BIN compare_matching.py --config $CONFIG $*"
-  $PYTHON_BIN compare_matching.py --config "$CONFIG" "$@" --dataset "$dataset" --downscale "$downscale" --lightglue-filter-threshold "$lg_thresh" --superpoint-detection-threshold "$sp_thresh" --disk-detection-threshold "$disk_thresh" --aliked-detection-threshold "$aliked_thresh"
+  $PYTHON_BIN compare_matching.py --config "$CONFIG" "$@" --dataset "$dataset" --downscale "$downscale" --lightglue-filter-threshold "$lg_thresh" --superpoint-detection-threshold "$sp_thresh" --disk-detection-threshold "$disk_thresh" --aliked-model-name "$aliked_model" --aliked-detection-threshold "$aliked_thresh"
 }
 
 for entry in "${MODEL_WEIGHTS[@]}"; do

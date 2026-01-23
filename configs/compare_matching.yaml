@@ -16,6 +16,7 @@ sift_n_octave_layers: 10
 
 disk_max_keypoints: 5000
 disk_detection_threshold: 0.0
+aliked_model_name: aliked-t16
 aliked_max_keypoints: 5000
 aliked_detection_threshold: 0.0
 

@@ -41,6 +41,7 @@ NN_MATCH_COLOR = "blue"
 LG_MATCH_COLOR = "lime"
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
+ALIKED_MODEL_CHOICES = tuple(sorted(ALIKED.cfgs.keys()))
 
 
 def nn_match_two_way(
@@ -476,6 +477,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sift-n-octave-layers", type=int, default=None)
     parser.add_argument("--disk-max-keypoints", type=int, default=None)
     parser.add_argument("--disk-detection-threshold", type=float, default=None)
+    parser.add_argument(
+        "--aliked-model-name",
+        type=str,
+        default=None,
+        choices=ALIKED_MODEL_CHOICES,
+    )
     parser.add_argument("--aliked-max-keypoints", type=int, default=None)
     parser.add_argument("--aliked-detection-threshold", type=float, default=None)
     parser.add_argument("--nn-match-threshold", type=float, default=None)
@@ -531,6 +538,7 @@ def parse_args() -> argparse.Namespace:
             "sift_n_octave_layers",
             "disk_max_keypoints",
             "disk_detection_threshold",
+            "aliked_model_name",
             "aliked_max_keypoints",
             "aliked_detection_threshold",
             # "nn_match_threshold",
@@ -883,6 +891,8 @@ def main() -> int:
     ).eval().to(DEVICE)
 
     aliked_conf = {}
+    if args.aliked_model_name is not None:
+        aliked_conf["model_name"] = args.aliked_model_name
     if args.aliked_max_keypoints is not None:
         aliked_conf["max_num_keypoints"] = args.aliked_max_keypoints
     if args.aliked_detection_threshold is not None:
