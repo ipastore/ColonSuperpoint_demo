@@ -641,6 +641,7 @@ def process_pair(
     extractor_disk: DISK,
     matcher_disk_lg: LightGlue,
     extractor_aliked: ALIKED,
+    extractor_aliked_t16: Optional[ALIKED],
     matcher_aliked_lg: LightGlue,
     superpoint_extractor: Optional[SuperPointFromWeights],
     matcher_superpoint_lg: Optional[LightGlue],
@@ -724,6 +725,14 @@ def process_pair(
             extractor_aliked, image1, "ALIKED", time_sums, time_counts
         )
 
+        desc0 = feats0_aliked.get("descriptors")
+        desc1 = feats1_aliked.get("descriptors")
+        if isinstance(desc0, torch.Tensor) and isinstance(desc1, torch.Tensor):
+            pad_dim = matcher_aliked_lg.conf.input_dim - desc0.shape[-1]
+            if pad_dim > 0:
+                feats0_aliked["descriptors"] = F.pad(desc0, (0, pad_dim))
+                feats1_aliked["descriptors"] = F.pad(desc1, (0, pad_dim))
+
         matches_aliked_lg_batch = matcher_aliked_lg(
             {"image0": feats0_aliked, "image1": feats1_aliked}
         )
@@ -736,6 +745,41 @@ def process_pair(
             feats0_aliked, feats1_aliked, nn_threshold, ratio_nn_thresh
         )
         aliked_row = (feats0_aliked, feats1_aliked, matches_aliked_nn, matches_aliked_lg)
+
+    aliked_t16_row = None
+    if extractor_aliked_t16 is not None and matcher_aliked_lg is not None:
+        feats0_aliked_t16 = timed_extract(
+            extractor_aliked_t16, image0, "ALIKED-T16", time_sums, time_counts
+        )
+        feats1_aliked_t16 = timed_extract(
+            extractor_aliked_t16, image1, "ALIKED-T16", time_sums, time_counts
+        )
+
+        desc0 = feats0_aliked_t16.get("descriptors")
+        desc1 = feats1_aliked_t16.get("descriptors")
+        if isinstance(desc0, torch.Tensor) and isinstance(desc1, torch.Tensor):
+            pad_dim = matcher_aliked_lg.conf.input_dim - desc0.shape[-1]
+            if pad_dim > 0:
+                feats0_aliked_t16["descriptors"] = F.pad(desc0, (0, pad_dim))
+                feats1_aliked_t16["descriptors"] = F.pad(desc1, (0, pad_dim))
+
+        matches_aliked_t16_lg_batch = matcher_aliked_lg(
+            {"image0": feats0_aliked_t16, "image1": feats1_aliked_t16}
+        )
+        feats0_aliked_t16 = detach_to_cpu(rbd(feats0_aliked_t16))
+        feats1_aliked_t16 = detach_to_cpu(rbd(feats1_aliked_t16))
+        matches_aliked_t16_lg = lightglue_matches_to_tensor(
+            rbd(matches_aliked_t16_lg_batch)["matches"]
+        )
+        matches_aliked_t16_nn = run_nn_matching(
+            feats0_aliked_t16, feats1_aliked_t16, nn_threshold, ratio_nn_thresh
+        )
+        aliked_t16_row = (
+            feats0_aliked_t16,
+            feats1_aliked_t16,
+            matches_aliked_t16_nn,
+            matches_aliked_t16_lg,
+        )
 
     superpoint_row = None
     if superpoint_extractor is not None and matcher_superpoint_lg is not None:
@@ -790,6 +834,24 @@ def process_pair(
                 image1_np,
             )
         )
+    if aliked_t16_row is not None:
+        (
+            feats0_aliked_t16,
+            feats1_aliked_t16,
+            matches_aliked_t16_nn,
+            matches_aliked_t16_lg,
+        ) = aliked_t16_row
+        rows.append(
+            (
+                "ALIKED-T16 (pad)",
+                feats0_aliked_t16,
+                feats1_aliked_t16,
+                matches_aliked_t16_nn,
+                matches_aliked_t16_lg,
+                image0_np,
+                image1_np,
+            )
+        )
     if superpoint_row is not None:
         feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg = superpoint_row
         rows.append(
@@ -817,7 +879,13 @@ def main() -> int:
     DEVICE = torch.device(args.device)
     torch.set_grad_enabled(False)
 
-    time_sums = {"SIFT": 0.0, "DISK": 0.0, "ALIKED": 0.0, "SuperPoint": 0.0}
+    time_sums = {
+        "SIFT": 0.0,
+        "DISK": 0.0,
+        "ALIKED": 0.0,
+        "ALIKED-T16": 0.0,
+        "SuperPoint": 0.0,
+    }
     time_counts = {name: 0 for name in time_sums}
 
     dataset_root = Path(args.dataset).resolve()
@@ -898,6 +966,9 @@ def main() -> int:
     if args.aliked_detection_threshold is not None:
         aliked_conf["detection_threshold"] = args.aliked_detection_threshold
     extractor_aliked = ALIKED(**aliked_conf).eval().to(DEVICE)
+    aliked_t16_conf = dict(aliked_conf)
+    aliked_t16_conf["model_name"] = "aliked-t16"
+    extractor_aliked_t16 = ALIKED(**aliked_t16_conf).eval().to(DEVICE)
     matcher_aliked_lg = LightGlue(
         features="aliked",
         filter_threshold=args.lightglue_filter_threshold,
@@ -945,6 +1016,7 @@ def main() -> int:
                 extractor_disk,
                 matcher_disk_lg,
                 extractor_aliked,
+                extractor_aliked_t16,
                 matcher_aliked_lg,
                 superpoint_extractor,
                 matcher_superpoint_lg,
@@ -994,7 +1066,7 @@ def main() -> int:
     with timing_path.open("w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["extractor", "mean_time_sec", "total_time_sec", "num_images"])
-        for name in ["SIFT", "DISK", "ALIKED", "SuperPoint"]:
+        for name in ["SIFT", "DISK", "ALIKED", "ALIKED-T16", "SuperPoint"]:
             total = time_sums.get(name, 0.0)
             count = time_counts.get(name, 0)
             mean = total / count if count else 0.0
