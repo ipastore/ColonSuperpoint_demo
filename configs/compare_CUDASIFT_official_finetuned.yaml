@@ -1,0 +1,16 @@
+cuda_sift_dataset: ./assets/matching/no_crop_1440x1080
+
+output_dir: ./matching_outputs/lightglue_cudasift_weights
+run_name: 1e-03_1e-03_ds2
+
+downscale: 2
+
+official_lightglue_filter_threshold: 1e-03
+finetuned_lightglue_filter_threshold: 1e-03
+lightglue_depth_confidence: -1
+lightglue_width_confidence: -1
+
+official_weights: weights/lightglue/sift_lightglue_official.pth
+finetuned_weights: weights/lightglue/long26_gt_pos_null_10_lg1e-03_lr5e-05_5bin.pth
+
+device: cuda

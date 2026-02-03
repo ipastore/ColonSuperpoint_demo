@@ -3,21 +3,31 @@
 dataset: ./assets/matching/crop_1350x1012/
 cuda_sift_dataset: ./assets/matching/no_crop_1440x1080
 
-downscale: 1
+run_name: lg1e-03_cudasfit_finetuned_ds2_vs_official_7000
 
-lightglue_filter_threshold: 0.05
+downscale: 2
+
+lightglue_filter_threshold: 0.001
 lightglue_depth_confidence: -1
 lightglue_width_confidence: -1
+cudasift_lightglue_weights: ./weights/lightglue/long26_gt_pos_null_10_lg1e-03_lr5e-05_5bin.pth
+enable_sift: true
+enable_cudasift_official: true
+enable_cudasift_finetuned: true
+enable_disk: false
+enable_aliked: false
+enable_aliked_t16: false
+enable_superpoint: false
 
-sift_max_keypoints: 5000
+sift_max_keypoints: 7000
 sift_contrast_threshold: 0.0
 sift_edge_threshold: 10.0
 sift_n_octave_layers: 10
 
-disk_max_keypoints: 5000
+disk_max_keypoints: 7000
 disk_detection_threshold: 0.0
 aliked_model_name: aliked-t16
-aliked_max_keypoints: 5000
+aliked_max_keypoints: 7000
 aliked_detection_threshold: 0.0
 
 nn_match_threshold: null
@@ -27,6 +37,6 @@ ratio_nn_thresh: null
 superpoint_model_name: MagicLeap
 superpoint_weights_path: ./weights/MagicLeap/superpoint_v1.pth
 superpoint_max_keypoints: 5000
-superpoint_detection_threshold: 0.0005
+superpoint_detection_threshold: 0.0
 
 device: cuda

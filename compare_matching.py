@@ -432,6 +432,22 @@ class SuperPointFromWeights(Extractor):
 
 
 def parse_args() -> argparse.Namespace:
+    def add_toggle(parser: argparse.ArgumentParser, name: str, help_text: str) -> None:
+        flag = name.replace("_", "-")
+        group = parser.add_mutually_exclusive_group()
+        group.add_argument(
+            f"--enable-{flag}",
+            dest=f"enable_{name}",
+            action="store_true",
+            help=f"Enable {help_text}.",
+        )
+        group.add_argument(
+            f"--disable-{flag}",
+            dest=f"enable_{name}",
+            action="store_false",
+            help=f"Disable {help_text}.",
+        )
+        parser.set_defaults(**{f"enable_{name}": None})
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument(
         "--config",
@@ -465,6 +481,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lightglue-filter-threshold", type=float, default=None)
     parser.add_argument("--lightglue-depth-confidence", type=float, default=None)
     parser.add_argument("--lightglue-width-confidence", type=float, default=None)
+    parser.add_argument(
+        "--cudasift-lightglue-weights",
+        type=str,
+        default=None,
+        help="Optional LightGlue weights path for the CudaSIFT row.",
+    )
     parser.add_argument(
         "--ratio-nn-thresh",
         type=float,
@@ -502,6 +524,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Computation device",
     )
+    add_toggle(parser, "sift", "OpenCV SIFT row")
+    add_toggle(parser, "cudasift_official", "CudaSIFT official row")
+    add_toggle(parser, "cudasift_finetuned", "CudaSIFT finetuned row")
+    add_toggle(parser, "disk", "DISK row")
+    add_toggle(parser, "aliked", "ALIKED row")
+    add_toggle(parser, "aliked_t16", "ALIKED-T16 row")
+    add_toggle(parser, "superpoint", "SuperPoint row")
 
     config_args, remaining = config_parser.parse_known_args()
     config_data = {}
@@ -523,32 +552,56 @@ def parse_args() -> argparse.Namespace:
     if opt.device is None:
         opt.device = default_device
 
-    missing = [
-        name
-        for name in [
-            "dataset",
-            "cuda_sift_dataset",
-            "downscale",
-            "lightglue_filter_threshold",
-            "lightglue_depth_confidence",
-            "lightglue_width_confidence",
+    toggle_defaults = {
+        "enable_sift": True,
+        "enable_cudasift_official": True,
+        "enable_cudasift_finetuned": True,
+        "enable_disk": True,
+        "enable_aliked": True,
+        "enable_aliked_t16": True,
+        "enable_superpoint": True,
+    }
+    for key, default in toggle_defaults.items():
+        if getattr(opt, key, None) is None:
+            setattr(opt, key, default)
+
+    required = [
+        "dataset",
+        "downscale",
+        "lightglue_filter_threshold",
+        "lightglue_depth_confidence",
+        "lightglue_width_confidence",
+    ]
+    if opt.enable_sift:
+        required += [
             "sift_max_keypoints",
             "sift_contrast_threshold",
             "sift_edge_threshold",
             "sift_n_octave_layers",
+        ]
+    if opt.enable_cudasift_official or opt.enable_cudasift_finetuned:
+        required.append("cuda_sift_dataset")
+    if opt.enable_disk:
+        required += [
             "disk_max_keypoints",
             "disk_detection_threshold",
-            "aliked_model_name",
+        ]
+    if opt.enable_aliked:
+        required.append("aliked_model_name")
+    if opt.enable_aliked or opt.enable_aliked_t16:
+        required += [
             "aliked_max_keypoints",
             "aliked_detection_threshold",
-            # "nn_match_threshold",
+        ]
+    if opt.enable_superpoint:
+        required += [
             "superpoint_model_name",
             "superpoint_weights_path",
             "superpoint_max_keypoints",
             "superpoint_detection_threshold",
         ]
-        if getattr(opt, name, None) is None
-    ]
+
+    missing = [name for name in required if getattr(opt, name, None) is None]
     if missing:
         parser.error(
             "Missing required options (provide via CLI or config): "
@@ -556,6 +609,49 @@ def parse_args() -> argparse.Namespace:
         )
 
     return opt
+
+
+def build_sift_lightglue_matcher(
+    device: torch.device,
+    *,
+    filter_threshold: float,
+    depth_confidence: float,
+    width_confidence: float,
+    weights_path: Optional[Path] = None,
+) -> LightGlue:
+    """Build a SIFT LightGlue matcher, optionally loading custom weights."""
+    if weights_path is None:
+        return (
+            LightGlue(
+                features="sift",
+                filter_threshold=filter_threshold,
+                depth_confidence=depth_confidence,
+                width_confidence=width_confidence,
+            )
+            .eval()
+            .to(device)
+        )
+
+    resolved = Path(weights_path).expanduser()
+    if not resolved.exists():
+        raise FileNotFoundError(f"LightGlue weights not found: {resolved}")
+
+    sift_conf = LightGlue.features["sift"]
+    matcher = (
+        LightGlue(
+            features=None,
+            input_dim=sift_conf["input_dim"],
+            add_scale_ori=sift_conf.get("add_scale_ori", False),
+            filter_threshold=filter_threshold,
+            depth_confidence=depth_confidence,
+            width_confidence=width_confidence,
+        )
+        .eval()
+        .to(device)
+    )
+    state_dict = torch.load(str(resolved), map_location="cpu")
+    matcher.load_state_dict(state_dict, strict=False)
+    return matcher
 
 
 def gather_image_sets(root: Path) -> List[Tuple[Path, List[Path]]]:
@@ -636,19 +732,27 @@ def process_pair(
     image0_path: Path,
     image1_path: Path,
     downscale: int,
-    extractor_sift: SIFT,
-    matcher_sift_lg: LightGlue,
-    extractor_disk: DISK,
-    matcher_disk_lg: LightGlue,
-    extractor_aliked: ALIKED,
+    extractor_sift: Optional[SIFT],
+    matcher_sift_lg: Optional[LightGlue],
+    matcher_cudasift_lg: Optional[LightGlue],
+    extractor_disk: Optional[DISK],
+    matcher_disk_lg: Optional[LightGlue],
+    extractor_aliked: Optional[ALIKED],
     extractor_aliked_t16: Optional[ALIKED],
-    matcher_aliked_lg: LightGlue,
+    matcher_aliked_lg: Optional[LightGlue],
     superpoint_extractor: Optional[SuperPointFromWeights],
     matcher_superpoint_lg: Optional[LightGlue],
     nn_threshold: float,
     ratio_nn_thresh: Optional[float],
     superpoint_label: Optional[str],
-    cuda_dataset_root: Path,
+    cuda_dataset_root: Optional[Path],
+    enable_sift: bool,
+    enable_cudasift_official: bool,
+    enable_cudasift_finetuned: bool,
+    enable_disk: bool,
+    enable_aliked: bool,
+    enable_aliked_t16: bool,
+    enable_superpoint: bool,
     time_sums: dict,
     time_counts: dict,
 ) -> List[Tuple[str, dict, dict, torch.Tensor, torch.Tensor, np.ndarray, np.ndarray]]:
@@ -663,39 +767,87 @@ def process_pair(
 
     # Patch for downscaling the scales of OpenCV instead of using directly match_pair
     # Extract SIFT features, convert OpenCV scales to sigma, and match with LightGlue
-    feats0_sift = timed_extract(extractor_sift, image0, "SIFT", time_sums, time_counts)
-    feats1_sift = timed_extract(extractor_sift, image1, "SIFT", time_sums, time_counts)
-    feats0_sift = harmonize_sift_scales(feats0_sift, extractor_sift.conf.backend)
-    feats1_sift = harmonize_sift_scales(feats1_sift, extractor_sift.conf.backend)
-    matches_sift_lg_batch = matcher_sift_lg({"image0": feats0_sift, "image1": feats1_sift})
-    feats0_sift = detach_to_cpu(rbd(feats0_sift))
-    feats1_sift = detach_to_cpu(rbd(feats1_sift))
-    matches_sift_lg = lightglue_matches_to_tensor(rbd(matches_sift_lg_batch)["matches"])
+    feats0_sift = None
+    feats1_sift = None
+    matches_sift_lg = None
+    matches_sift_nn = None
+    if enable_sift:
+        if extractor_sift is None or matcher_sift_lg is None:
+            raise ValueError("SIFT extractor and matcher are required when enabled.")
+        feats0_sift = timed_extract(
+            extractor_sift, image0, "SIFT", time_sums, time_counts
+        )
+        feats1_sift = timed_extract(
+            extractor_sift, image1, "SIFT", time_sums, time_counts
+        )
+        feats0_sift = harmonize_sift_scales(feats0_sift, extractor_sift.conf.backend)
+        feats1_sift = harmonize_sift_scales(feats1_sift, extractor_sift.conf.backend)
+        matches_sift_lg_batch = matcher_sift_lg(
+            {"image0": feats0_sift, "image1": feats1_sift}
+        )
+        feats0_sift = detach_to_cpu(rbd(feats0_sift))
+        feats1_sift = detach_to_cpu(rbd(feats1_sift))
+        matches_sift_lg = lightglue_matches_to_tensor(
+            rbd(matches_sift_lg_batch)["matches"]
+        )
 
-    
-    # Match SIFT features with NN
-    matches_sift_nn = run_nn_matching(feats0_sift, feats1_sift, nn_threshold, ratio_nn_thresh)
+        # Match SIFT features with NN
+        matches_sift_nn = run_nn_matching(
+            feats0_sift, feats1_sift, nn_threshold, ratio_nn_thresh
+        )
 
     # Extract CudaSIFT features from .bin files
     def image_to_bin_path(path: Path) -> Path:
         return path.with_name(path.stem + "_sift.bin")
-    cuda_image0_path = cuda_dataset_root / image0_path.parent.name / image0_path.name
-    cuda_image1_path = cuda_dataset_root / image1_path.parent.name / image1_path.name
-    image_size = feats0_sift["image_size"]
-    feats0_bin_raw = load_sift_bin(image_to_bin_path(cuda_image0_path), image_size)
-    feats1_bin_raw = load_sift_bin(image_to_bin_path(cuda_image1_path), image_size)
+    feats0_bin = None
+    feats1_bin = None
+    matches_bin_lg_official = None
+    matches_bin_lg_finetuned = None
+    matches_bin_nn = None
+    cuda_image0_np = None
+    cuda_image1_np = None
+    if enable_cudasift_official or enable_cudasift_finetuned:
+        if cuda_dataset_root is None:
+            raise ValueError("cuda_dataset_root is required for CudaSIFT rows.")
+        if enable_cudasift_official and matcher_sift_lg is None:
+            raise ValueError("Official CudaSIFT matcher is required when enabled.")
+        if enable_cudasift_finetuned and matcher_cudasift_lg is None:
+            raise ValueError("Finetuned CudaSIFT matcher is required when enabled.")
+        cuda_image0_path = cuda_dataset_root / image0_path.parent.name / image0_path.name
+        cuda_image1_path = cuda_dataset_root / image1_path.parent.name / image1_path.name
+        cuda_image0 = load_preprocessed_image(cuda_image0_path, downscale)
+        cuda_image1 = load_preprocessed_image(cuda_image1_path, downscale)
+        cuda_image0_np = cuda_image0.permute(1, 2, 0).cpu().numpy()
+        cuda_image1_np = cuda_image1.permute(1, 2, 0).cpu().numpy()
+        image_size = (cuda_image0.shape[-1], cuda_image0.shape[-2])
+        feats0_bin_raw = load_sift_bin(image_to_bin_path(cuda_image0_path), image_size)
+        feats1_bin_raw = load_sift_bin(image_to_bin_path(cuda_image1_path), image_size)
 
-    # Match CudaSIFT features with LightGLue and NN
-    matches_bin_lg_batch = matcher_sift_lg({"image0": feats0_bin_raw, "image1": feats1_bin_raw})
-    feats0_bin = detach_to_cpu(rbd(feats0_bin_raw))
-    feats1_bin = detach_to_cpu(rbd(feats1_bin_raw))
-    feats0_bin = rescale_feature_dict(feats0_bin, downscale)
-    feats1_bin = rescale_feature_dict(feats1_bin, downscale)
-    matches_bin_lg = lightglue_matches_to_tensor(rbd(matches_bin_lg_batch)["matches"])
-    matches_bin_nn = run_nn_matching(feats0_bin, feats1_bin, nn_threshold, ratio_nn_thresh)
+        if enable_cudasift_official:
+            matches_bin_lg_official_batch = matcher_sift_lg(
+                {"image0": feats0_bin_raw, "image1": feats1_bin_raw}
+            )
+            matches_bin_lg_official = lightglue_matches_to_tensor(
+                rbd(matches_bin_lg_official_batch)["matches"]
+            )
+        if enable_cudasift_finetuned:
+            matches_bin_lg_finetuned_batch = matcher_cudasift_lg(
+                {"image0": feats0_bin_raw, "image1": feats1_bin_raw}
+            )
+            matches_bin_lg_finetuned = lightglue_matches_to_tensor(
+                rbd(matches_bin_lg_finetuned_batch)["matches"]
+            )
+
+        feats0_bin = detach_to_cpu(rbd(feats0_bin_raw))
+        feats1_bin = detach_to_cpu(rbd(feats1_bin_raw))
+        feats0_bin = rescale_feature_dict(feats0_bin, downscale)
+        feats1_bin = rescale_feature_dict(feats1_bin, downscale)
+        matches_bin_nn = run_nn_matching(
+            feats0_bin, feats1_bin, nn_threshold, ratio_nn_thresh
+        )
 
     disk_row = None
-    if extractor_disk is not None and matcher_disk_lg is not None:
+    if enable_disk and extractor_disk is not None and matcher_disk_lg is not None:
         feats0_disk = timed_extract(
             extractor_disk, image0, "DISK", time_sums, time_counts
         )
@@ -717,7 +869,7 @@ def process_pair(
         disk_row = (feats0_disk, feats1_disk, matches_disk_nn, matches_disk_lg)
 
     aliked_row = None
-    if extractor_aliked is not None and matcher_aliked_lg is not None:
+    if enable_aliked and extractor_aliked is not None and matcher_aliked_lg is not None:
         feats0_aliked = timed_extract(
             extractor_aliked, image0, "ALIKED", time_sums, time_counts
         )
@@ -747,7 +899,7 @@ def process_pair(
         aliked_row = (feats0_aliked, feats1_aliked, matches_aliked_nn, matches_aliked_lg)
 
     aliked_t16_row = None
-    if extractor_aliked_t16 is not None and matcher_aliked_lg is not None:
+    if enable_aliked_t16 and extractor_aliked_t16 is not None and matcher_aliked_lg is not None:
         feats0_aliked_t16 = timed_extract(
             extractor_aliked_t16, image0, "ALIKED-T16", time_sums, time_counts
         )
@@ -782,7 +934,7 @@ def process_pair(
         )
 
     superpoint_row = None
-    if superpoint_extractor is not None and matcher_superpoint_lg is not None:
+    if enable_superpoint and superpoint_extractor is not None and matcher_superpoint_lg is not None:
         feats0_sp = timed_extract(
             superpoint_extractor, image0, "SuperPoint", time_sums, time_counts
         )
@@ -801,13 +953,43 @@ def process_pair(
         matches_sp_nn = run_nn_matching(feats0_sp, feats1_sp, nn_threshold, ratio_nn_thresh)
         superpoint_row = (feats0_sp, feats1_sp, matches_sp_nn, matches_sp_lg)
 
-    cuda_image0_np = load_preprocessed_image(cuda_image0_path, downscale).permute(1, 2, 0).cpu().numpy()
-    cuda_image1_np = load_preprocessed_image(cuda_image1_path, downscale).permute(1, 2, 0).cpu().numpy()
-
-    rows = [
-        ("SIFT", feats0_sift, feats1_sift, matches_sift_nn, matches_sift_lg, image0_np, image1_np),
-        ("CudaSIFT", feats0_bin, feats1_bin, matches_bin_nn, matches_bin_lg, cuda_image0_np, cuda_image1_np),
-    ]
+    rows = []
+    if enable_sift and feats0_sift is not None and feats1_sift is not None:
+        rows.append(
+            (
+                "SIFT",
+                feats0_sift,
+                feats1_sift,
+                matches_sift_nn,
+                matches_sift_lg,
+                image0_np,
+                image1_np,
+            )
+        )
+    if enable_cudasift_official and feats0_bin is not None and feats1_bin is not None:
+        rows.append(
+            (
+                "CudaSIFT (official)",
+                feats0_bin,
+                feats1_bin,
+                matches_bin_nn,
+                matches_bin_lg_official,
+                cuda_image0_np,
+                cuda_image1_np,
+            )
+        )
+    if enable_cudasift_finetuned and feats0_bin is not None and feats1_bin is not None:
+        rows.append(
+            (
+                "CudaSIFT (finetuned)",
+                feats0_bin,
+                feats1_bin,
+                matches_bin_nn,
+                matches_bin_lg_finetuned,
+                cuda_image0_np,
+                cuda_image1_np,
+            )
+        )
     if disk_row is not None:
         feats0_disk, feats1_disk, matches_disk_nn, matches_disk_lg = disk_row
         rows.append(
@@ -843,7 +1025,7 @@ def process_pair(
         ) = aliked_t16_row
         rows.append(
             (
-                "ALIKED-T16 (pad)",
+                "ALIKED-T16",
                 feats0_aliked_t16,
                 feats1_aliked_t16,
                 matches_aliked_t16_nn,
@@ -891,26 +1073,20 @@ def main() -> int:
     dataset_root = Path(args.dataset).resolve()
     image_sets = gather_image_sets(dataset_root)
 
-    weights_path = Path(args.superpoint_weights_path).expanduser()
-    dataset_token = dataset_root.name
-    weights_token = weights_path.stem if weights_path.name else "weights"
     base_dir = (
         Path(args.output_dir).expanduser().resolve()
         if args.output_dir
         else Path("./matching_outputs").resolve()
     )
     if args.run_name:
-        run_token = args.run_name
-        run_root = base_dir / (
-            f"{args.superpoint_model_name}") / (
-            f"{weights_token}_{run_token}"
-            )
-        
+        run_root = base_dir / args.run_name
     else:
-        run_root = base_dir / (
-            f"{args.superpoint_model_name}") / (
-            f"{weights_token}"
-            )
+        if args.enable_superpoint:
+            weights_path = Path(args.superpoint_weights_path).expanduser()
+            weights_token = weights_path.stem if weights_path.name else "weights"
+            run_root = base_dir / f"{args.superpoint_model_name}" / f"{weights_token}"
+        else:
+            run_root = base_dir / "comparison"
     if run_root.exists():
         raise RuntimeError(
             f"Output directory '{run_root}' already exists. Please choose a different --run-name."
@@ -924,61 +1100,95 @@ def main() -> int:
     config_snapshot.update(
         {
             "dataset_resolved": str(dataset_root),
-            "superpoint_weights_resolved": str(weights_path),
             "run_directory": str(run_root),
         }
     )
+    if args.enable_superpoint:
+        config_snapshot["superpoint_weights_resolved"] = str(
+            Path(args.superpoint_weights_path).expanduser()
+        )
     snapshot_path = run_root / "config_used.yaml"
     snapshot_path.write_text(yaml.safe_dump(config_snapshot, sort_keys=True))
 
-    extractor_sift = SIFT(
-        max_num_keypoints=args.sift_max_keypoints,
-        detection_threshold=args.sift_contrast_threshold,
-        edge_threshold=args.sift_edge_threshold,
-        num_octaves=args.sift_n_octave_layers,
-        backend="opencv",
-    ).eval().to(DEVICE)
-    matcher_sift_lg = LightGlue(
-        features="sift",
-        filter_threshold=args.lightglue_filter_threshold,
-        depth_confidence=args.lightglue_depth_confidence,
-        width_confidence=args.lightglue_width_confidence,
-    ).eval().to(DEVICE)
+    extractor_sift = None
+    if args.enable_sift:
+        extractor_sift = SIFT(
+            max_num_keypoints=args.sift_max_keypoints,
+            detection_threshold=args.sift_contrast_threshold,
+            edge_threshold=args.sift_edge_threshold,
+            num_octaves=args.sift_n_octave_layers,
+            backend="opencv",
+        ).eval().to(DEVICE)
 
-    disk_conf = {}
-    if args.disk_max_keypoints is not None:
-        disk_conf["max_num_keypoints"] = args.disk_max_keypoints
-    if args.disk_detection_threshold is not None:
-        disk_conf["detection_threshold"] = args.disk_detection_threshold
-    extractor_disk = DISK(**disk_conf).eval().to(DEVICE)
-    matcher_disk_lg = LightGlue(
-        features="disk",
-        filter_threshold=args.lightglue_filter_threshold,
-        depth_confidence=args.lightglue_depth_confidence,
-        width_confidence=args.lightglue_width_confidence,
-    ).eval().to(DEVICE)
+    matcher_sift_lg = None
+    if args.enable_sift or args.enable_cudasift_official:
+        matcher_sift_lg = build_sift_lightglue_matcher(
+            DEVICE,
+            filter_threshold=args.lightglue_filter_threshold,
+            depth_confidence=args.lightglue_depth_confidence,
+            width_confidence=args.lightglue_width_confidence,
+        )
 
-    aliked_conf = {}
-    if args.aliked_model_name is not None:
-        aliked_conf["model_name"] = args.aliked_model_name
-    if args.aliked_max_keypoints is not None:
-        aliked_conf["max_num_keypoints"] = args.aliked_max_keypoints
-    if args.aliked_detection_threshold is not None:
-        aliked_conf["detection_threshold"] = args.aliked_detection_threshold
-    extractor_aliked = ALIKED(**aliked_conf).eval().to(DEVICE)
-    aliked_t16_conf = dict(aliked_conf)
-    aliked_t16_conf["model_name"] = "aliked-t16"
-    extractor_aliked_t16 = ALIKED(**aliked_t16_conf).eval().to(DEVICE)
-    matcher_aliked_lg = LightGlue(
-        features="aliked",
-        filter_threshold=args.lightglue_filter_threshold,
-        depth_confidence=args.lightglue_depth_confidence,
-        width_confidence=args.lightglue_width_confidence,
-    ).eval().to(DEVICE)
+    matcher_cudasift_lg = None
+    if args.enable_cudasift_finetuned:
+        cudasift_weights = (
+            Path(args.cudasift_lightglue_weights).expanduser()
+            if args.cudasift_lightglue_weights
+            else None
+        )
+        matcher_cudasift_lg = build_sift_lightglue_matcher(
+            DEVICE,
+            filter_threshold=args.lightglue_filter_threshold,
+            depth_confidence=args.lightglue_depth_confidence,
+            width_confidence=args.lightglue_width_confidence,
+            weights_path=cudasift_weights,
+        )
+
+    extractor_disk = None
+    matcher_disk_lg = None
+    if args.enable_disk:
+        disk_conf = {}
+        if args.disk_max_keypoints is not None:
+            disk_conf["max_num_keypoints"] = args.disk_max_keypoints
+        if args.disk_detection_threshold is not None:
+            disk_conf["detection_threshold"] = args.disk_detection_threshold
+        extractor_disk = DISK(**disk_conf).eval().to(DEVICE)
+        matcher_disk_lg = LightGlue(
+            features="disk",
+            filter_threshold=args.lightglue_filter_threshold,
+            depth_confidence=args.lightglue_depth_confidence,
+            width_confidence=args.lightglue_width_confidence,
+        ).eval().to(DEVICE)
+
+    extractor_aliked = None
+    extractor_aliked_t16 = None
+    matcher_aliked_lg = None
+    if args.enable_aliked or args.enable_aliked_t16:
+        aliked_common_conf = {}
+        if args.aliked_max_keypoints is not None:
+            aliked_common_conf["max_num_keypoints"] = args.aliked_max_keypoints
+        if args.aliked_detection_threshold is not None:
+            aliked_common_conf["detection_threshold"] = args.aliked_detection_threshold
+        if args.enable_aliked:
+            aliked_conf = dict(aliked_common_conf)
+            if args.aliked_model_name is not None:
+                aliked_conf["model_name"] = args.aliked_model_name
+            extractor_aliked = ALIKED(**aliked_conf).eval().to(DEVICE)
+        if args.enable_aliked_t16:
+            aliked_t16_conf = dict(aliked_common_conf)
+            aliked_t16_conf["model_name"] = "aliked-t16"
+            extractor_aliked_t16 = ALIKED(**aliked_t16_conf).eval().to(DEVICE)
+        matcher_aliked_lg = LightGlue(
+            features="aliked",
+            filter_threshold=args.lightglue_filter_threshold,
+            depth_confidence=args.lightglue_depth_confidence,
+            width_confidence=args.lightglue_width_confidence,
+        ).eval().to(DEVICE)
 
     superpoint_extractor = None
     matcher_superpoint_lg = None
-    if args.superpoint_weights_path:
+    if args.enable_superpoint and args.superpoint_weights_path:
+        weights_path = Path(args.superpoint_weights_path).expanduser()
         if not weights_path.exists():
             print(f"SuperPoint weights not found: {weights_path}", file=sys.stderr)
             return 1
@@ -996,10 +1206,14 @@ def main() -> int:
             width_confidence=args.lightglue_width_confidence,
         ).eval().to(DEVICE)
 
-    cuda_dataset_root = Path(args.cuda_sift_dataset or "./assets/matching/no_crop_1440x1080").resolve()
-    if not cuda_dataset_root.exists():
-        print(f"CudaSIFT dataset not found: {cuda_dataset_root}", file=sys.stderr)
-        return 1
+    cuda_dataset_root = None
+    if args.enable_cudasift_official or args.enable_cudasift_finetuned:
+        cuda_dataset_root = Path(
+            args.cuda_sift_dataset or "./assets/matching/no_crop_1440x1080"
+        ).resolve()
+        if not cuda_dataset_root.exists():
+            print(f"CudaSIFT dataset not found: {cuda_dataset_root}", file=sys.stderr)
+            return 1
 
     for folder, images in image_sets:
         out_subfolder = run_root / folder.name
@@ -1013,6 +1227,7 @@ def main() -> int:
                 args.downscale,
                 extractor_sift,
                 matcher_sift_lg,
+                matcher_cudasift_lg,
                 extractor_disk,
                 matcher_disk_lg,
                 extractor_aliked,
@@ -1024,6 +1239,13 @@ def main() -> int:
                 args.ratio_nn_thresh,
                 args.superpoint_model_name if superpoint_extractor is not None else None,
                 cuda_dataset_root,
+                args.enable_sift,
+                args.enable_cudasift_official,
+                args.enable_cudasift_finetuned,
+                args.enable_disk,
+                args.enable_aliked,
+                args.enable_aliked_t16,
+                args.enable_superpoint,
                 time_sums,
                 time_counts,
             )
